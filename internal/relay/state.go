@@ -1,11 +1,14 @@
 package relay
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/UPAX-platform/zk-relay/internal/zk"
@@ -19,10 +22,13 @@ type State struct {
 	// Count is the position (1-based) in the device log of the last
 	// uploaded record; LastKey/LastTime identify that record so we can
 	// detect the log being cleared or rolled over.
-	Count        int       `json:"count"`
-	LastKey      string    `json:"last_key,omitempty"`
-	LastTime     time.Time `json:"last_time,omitempty"`
-	Uploaded     int64     `json:"uploaded_total"`
+	Count    int       `json:"count"`
+	LastKey  string    `json:"last_key,omitempty"`
+	LastTime time.Time `json:"last_time,omitempty"`
+	Uploaded int64     `json:"uploaded_total"`
+	// Address identifies the UPAX device address the log was uploaded to
+	// (addressID), so a device moved to another UPAX record starts over.
+	Address      string    `json:"address,omitempty"`
 	LastUploadAt time.Time `json:"last_upload_at,omitempty"`
 
 	path string
@@ -83,6 +89,13 @@ func recordKey(r zk.Record) string {
 }
 
 // plan decides which records (by index) still need uploading.
+//
+// UPAX skips a punch it already has (same device, PIN, time and state), so
+// whenever the relay can't tell exactly where it left off it re-sends rather
+// than guesses: a duplicate costs bandwidth, a skipped punch is lost.
+// serverStamp (UPAX's ATTLOGStamp) only says whether UPAX has punches from
+// this device at all. It is not used as a log position, because the log may
+// have been cleared or rolled since it was set.
 func plan(recs []zk.Record, st *State, serverStamp int64, backfill string) (idx []int, note string) {
 	n := len(recs)
 	from := func(start int) []int {
@@ -97,9 +110,24 @@ func plan(recs []zk.Record, st *State, serverStamp int64, backfill string) (idx 
 		st.Initialized = true
 		start := 0
 		switch {
-		case serverStamp > 0 && serverStamp <= int64(n):
-			start = int(serverStamp)
-			note = fmt.Sprintf("first run: platform already has %d records, resuming after them", start)
+		case strings.HasPrefix(backfill, "since:"):
+			// Skip up to the first record on/after the date. A record after
+			// it with an earlier time (the device clock was set back) is
+			// still sent: over-sending is safe, skipping is not.
+			since, _ := time.ParseInLocation(time.DateOnly, strings.TrimPrefix(backfill, "since:"), time.UTC)
+			start = n
+			for i, r := range recs {
+				if !r.Time.Before(since) {
+					start = i
+					break
+				}
+			}
+			note = fmt.Sprintf("first run: skipping %d records before %s, uploading %d (backfill: %s)", start, since.Format(time.DateOnly), n-start, backfill)
+		case serverStamp > 0:
+			// UPAX already has punches from this device but the relay has
+			// no record of sending them (a reinstall, or another machine):
+			// re-send the log so nothing made in between is missed.
+			note = fmt.Sprintf("first run: UPAX already has punches from this device; re-sending all %d stored records (UPAX skips the ones it has)", n)
 		case backfill == "none":
 			start = n
 			note = fmt.Sprintf("first run: skipping %d historic records (backfill: none)", n)
@@ -125,10 +153,16 @@ func plan(recs []zk.Record, st *State, serverStamp int64, backfill string) (idx 
 			return from(i + 1), fmt.Sprintf("device log shifted; last uploaded record now at position %d", i+1)
 		}
 	}
-	for i, r := range recs {
-		if r.Time.After(st.LastTime) {
-			idx = append(idx, i)
-		}
-	}
-	return idx, fmt.Sprintf("device log was cleared or replaced; uploading %d records newer than %s", len(idx), st.LastTime.Format(time.DateTime))
+	// The last uploaded record is gone, so everything left is either newer
+	// or already in UPAX. Times can't decide which: the clock may have been
+	// set back. Send it all.
+	st.Count = 0
+	return from(0), fmt.Sprintf("device log was cleared or replaced; re-sending all %d records (UPAX skips the ones it has)", n)
+}
+
+// addressID identifies a UPAX device address without storing it: the
+// address carries the device token, a credential.
+func addressID(u string) string {
+	sum := sha256.Sum256([]byte(strings.TrimRight(strings.TrimSpace(u), "/")))
+	return hex.EncodeToString(sum[:8])
 }

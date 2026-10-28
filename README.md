@@ -33,12 +33,22 @@ curl -fsSL https://github.com/UPAX-platform/zk-relay/releases/latest/download/in
 irm https://github.com/UPAX-platform/zk-relay/releases/latest/download/install.ps1 | iex
 ```
 
-The installer downloads the binary and starts `upax-relay setup`. Setup:
+The installer downloads the binary, checks it against the release's
+`checksums.txt`, and starts `upax-relay setup`. Setup:
 
 1. connects to the device, or scans the network for it if you leave the IP blank,
-2. checks that UPAX accepts the device address,
-3. asks whether to upload the punches already stored on the device,
-4. writes the config and installs and starts the background service.
+2. checks that UPAX accepts the device address and tells you whether the device
+   still needs activating in UPAX (*HR › Devices*),
+3. asks which of the punches already stored on the device to upload,
+4. writes the config, installs the binary to a fixed place (`/usr/local/bin` or
+   `%ProgramFiles%\UPAX Relay`), installs and starts the background service, and
+   waits until the service has reached UPAX.
+
+A new device shows up in UPAX with its serial number as soon as setup checks
+the address. It stays *pending* until an admin activates it. Until then the
+relay keeps in touch with UPAX, so the device doesn't go stale, but it doesn't
+upload anything: punches stay on the device and go up as soon as UPAX
+activates it. The same goes for a device that is *paused* in UPAX.
 
 Running the installer again upgrades the relay in place.
 
@@ -53,7 +63,7 @@ sudo upax-relay setup --device 192.168.1.201 --url https://upax.example.com/<dev
 
 | Command | What it does |
 |---|---|
-| `upax-relay status` | Shows whether the service is running and how many punches it has uploaded |
+| `upax-relay status` | Shows whether the service is running, the device's state in UPAX, when it last reached UPAX, and how many punches it has uploaded or still has to. Works without administrator rights |
 | `upax-relay test` | Checks the connection to each device and to UPAX |
 | `upax-relay scan` | Finds ZKTeco devices on the local network |
 | `upax-relay setup` | Adds another device, or changes an existing one |
@@ -81,11 +91,16 @@ devices:
   - name: Warehouse
     host: 192.168.1.202
     upax_url: https://upax.example.com/<device-address-2>
-backfill: all             # first run: upload stored history (all) or only new punches (none)
+backfill: all             # first run: stored history (all), only new punches (none), or since:2026-01-01
 poll_interval: 5s         # how often to check the device for new punches
 ```
 
 One relay can serve any number of devices. Each device needs its own UPAX address.
+
+If you point a device at a different UPAX address, the relay notices. When the
+new address is a new device in UPAX, the relay uploads the punches stored on the
+device to it again, as set by `backfill`. When it's the same device with a new
+address, it carries on where it left off.
 
 ## How it works
 
@@ -95,15 +110,26 @@ One relay can serve any number of devices. Each device needs its own UPAX addres
   10 minutes as a safety net. This is the same protocol as
   [pyzk](https://github.com/fananimi/pyzk), ported to Go.
 * **UPAX side.** The relay behaves like a push device:
-  * `GET /iclock/cdata?options=all` for the handshake,
-  * `POST /iclock/cdata?table=ATTLOG` to upload punches, as tab-separated `PIN, time, state, verify, workcode` lines,
-  * `GET /iclock/getrequest` as the heartbeat.
+  * `GET /iclock/cdata?options=all` for the handshake, carrying the device summary (`INFO=`).
+    It also sends `UPAXRelay=1`, which asks UPAX to add a `UPAXStatus=` line
+    (pending, active or paused). Real terminals never send it, so they never see that line.
+    The relay repeats the handshake every hour, and every minute while the device isn't active,
+  * `POST /iclock/cdata?table=ATTLOG` to upload punches, as tab-separated `PIN, time, state, verify, workcode` lines.
+    A batch only counts as sent when UPAX replies `OK: <number of lines>`,
+  * `GET /iclock/getrequest` as the heartbeat. It sends the device summary again only when the user or fingerprint count changes.
 
-  It acts on `CHECK`, `INFO`, `REBOOT` and `DATA QUERY ATTLOG` commands from UPAX. Any other command gets the reply "not supported" (`-1002`).
-* **No lost or duplicate punches.** After each successful upload, the relay
-  saves its position in the device log to `state-<serial>.json`.
+  It acts on the commands UPAX sends: `DATA UPDATE USERINFO` and `DATA DELETE USERINFO`
+  (keeps the device's user list in step with HR; an administrator on the device stays one) and `INFO`.
+  It also answers `CHECK`. Any other command gets the reply "not supported" (`-1002`).
+* **No lost punches.** After each successful upload, the relay saves its
+  position in the device log to `state-<serial>.json`.
   * If UPAX or the internet is down, punches stay on the device and are sent once the connection is back.
-  * If the device's log is cleared or its oldest records roll off, the relay finds the last punch it sent and continues from there.
+  * If the device's oldest records roll off, the relay finds the last punch it sent and continues from there.
+  * Whenever it can't tell where it left off (the log was cleared, the state file is gone, or it was installed
+    again or on another machine), it sends the whole log again. UPAX skips punches it already has, so re-sending
+    is safe. Skipping would not be, because the device clock may have been set back.
+* **Health.** The service writes `health-<device>.json` next to the config. That's what `status` and `setup` read.
+  It holds no device address, since the address contains the device's credential.
 * **Time.** Punches are sent with the device's own clock, exactly as a push
   device would send them. `upax-relay test` and `setup` warn you if the
   device clock is more than 2 minutes off.

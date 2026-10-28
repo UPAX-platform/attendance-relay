@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/kardianos/service"
@@ -132,13 +133,75 @@ func (p *program) Stop(s service.Service) error {
 	return nil
 }
 
-func newService(cfgPath string) (service.Service, *program, error) {
+// installedBinary is where the service runs the relay from: the path the
+// install scripts use, so the service never depends on wherever setup
+// happened to be run from (a download folder, or a `go run` build that is
+// deleted when it exits).
+func installedBinary() string {
+	if runtime.GOOS == "windows" {
+		pf := os.Getenv("ProgramFiles")
+		if pf == "" {
+			pf = `C:\Program Files`
+		}
+		return filepath.Join(pf, "UPAX Relay", "upax-relay.exe")
+	}
+	return "/usr/local/bin/upax-relay"
+}
+
+// ensureInstalledBinary copies the running binary to installedBinary unless
+// it is already running from there.
+func ensureInstalledBinary() (string, error) {
+	target := installedBinary()
+	self, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if self, err = filepath.EvalSymlinks(self); err != nil {
+		return "", err
+	}
+	if t, err := filepath.EvalSymlinks(target); err == nil && (t == self || runtime.GOOS == "windows" && strings.EqualFold(t, self)) {
+		return target, nil
+	}
+	src, err := os.Open(self)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return "", wrapPerm(err)
+	}
+	tmp := target + ".new"
+	dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return "", wrapPerm(err)
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		os.Remove(tmp)
+		return "", wrapPerm(err)
+	}
+	fmt.Printf("Installed %s\n", target)
+	return target, nil
+}
+
+// newService describes the service. exe is the binary it runs; "" leaves it
+// unset, which is fine for every action but install.
+func newService(cfgPath, exe string) (service.Service, *program, error) {
 	abs, err := filepath.Abs(cfgPath)
 	if err != nil {
 		return nil, nil, err
 	}
 	p := &program{cfgPath: abs}
 	sc := &service.Config{
+		Executable:  exe,
 		Name:        "upax-relay",
 		DisplayName: "UPAX ZKTeco Relay",
 		Description: "Forwards attendance punches from local ZKTeco devices to UPAX.",
@@ -169,7 +232,7 @@ func cmdRun(args []string) error {
 	if _, err := config.Load(*path); err != nil {
 		return fmt.Errorf("%w\nrun \"upax-relay setup\" first", err)
 	}
-	s, _, err := newService(*path)
+	s, _, err := newService(*path, "")
 	if err != nil {
 		return err
 	}
@@ -179,12 +242,17 @@ func cmdRun(args []string) error {
 func cmdService(action string, args []string) error {
 	fs, path := newFlags(action)
 	_ = fs.Parse(args)
+	exe := ""
 	if action == "install" {
 		if _, err := config.Load(*path); err != nil {
 			return fmt.Errorf("%w\nrun \"upax-relay setup\" first", err)
 		}
+		var err error
+		if exe, err = ensureInstalledBinary(); err != nil {
+			return err
+		}
 	}
-	s, _, err := newService(*path)
+	s, _, err := newService(*path, exe)
 	if err != nil {
 		return err
 	}
@@ -197,13 +265,21 @@ func cmdService(action string, args []string) error {
 
 // installAndStart (re)installs the service pointing at cfgPath and starts it.
 func installAndStart(cfgPath string) error {
-	s, _, err := newService(cfgPath)
+	old, _, err := newService(cfgPath, "")
 	if err != nil {
 		return err
 	}
-	if st, err := s.Status(); err == nil && st != service.StatusUnknown {
-		_ = s.Stop()
-		_ = s.Uninstall()
+	if st, err := old.Status(); err == nil && st != service.StatusUnknown {
+		_ = old.Stop()
+		_ = old.Uninstall()
+	}
+	exe, err := ensureInstalledBinary()
+	if err != nil {
+		return err
+	}
+	s, _, err := newService(cfgPath, exe)
+	if err != nil {
+		return err
 	}
 	if err := s.Install(); err != nil {
 		return wrapPerm(err)
@@ -224,11 +300,12 @@ func wrapPerm(err error) error {
 func cmdStatus(args []string) error {
 	fs, path := newFlags("status")
 	_ = fs.Parse(args)
-	s, _, err := newService(*path)
+	s, _, err := newService(*path, "")
 	if err != nil {
 		return err
 	}
 	st, err := s.Status()
+	running := false
 	switch {
 	case errors.Is(err, service.ErrNotInstalled):
 		fmt.Println("service: not installed")
@@ -236,19 +313,37 @@ func cmdStatus(args []string) error {
 		fmt.Println("service: unknown (", err, ")")
 	case st == service.StatusRunning:
 		fmt.Println("service: running")
+		running = true
 	case st == service.StatusStopped:
 		fmt.Println("service: stopped")
 	default:
 		fmt.Println("service: unknown")
 	}
+
+	// The config is readable by administrators only (it holds the device
+	// addresses); the service's health files next to it are not.
+	dir := filepath.Dir(*path)
 	cfg, err := config.Load(*path)
-	if err != nil {
+	switch {
+	case err == nil:
+		dir = cfg.StateDir()
+		fmt.Println("config:", cfg.Path())
+	case errors.Is(err, os.ErrPermission):
+		fmt.Println("config:", *path, "(readable with", adminWord()+")")
+	default:
 		fmt.Println("config:", err)
+	}
+	fmt.Println("log:   ", filepath.Join(dir, "relay.log"))
+
+	hs := relay.LoadAllHealth(dir)
+	for _, h := range hs {
+		printHealth(h, running)
+	}
+	if len(hs) > 0 {
 		return nil
 	}
-	fmt.Println("config:", cfg.Path())
-	fmt.Println("log:   ", filepath.Join(cfg.StateDir(), "relay.log"))
-	files, _ := filepath.Glob(filepath.Join(cfg.StateDir(), "state-*.json"))
+	// No health files: a relay from before they existed.
+	files, _ := filepath.Glob(filepath.Join(dir, "state-*.json"))
 	sort.Strings(files)
 	for _, f := range files {
 		ss, err := relay.LoadStateFile(f)
@@ -263,6 +358,58 @@ func cmdStatus(args []string) error {
 			ss.Serial, ss.Uploaded, last, ss.LastTime.Format(time.DateTime))
 	}
 	return nil
+}
+
+func printHealth(h *relay.Health, running bool) {
+	fmt.Printf("\n%s", h.Device)
+	if h.Device != h.Addr {
+		fmt.Printf(" (%s)", h.Addr)
+	}
+	if h.Serial != "" {
+		fmt.Printf(", serial %s", h.Serial)
+	}
+	fmt.Println()
+	contact := h.LastHandshake
+	if h.LastHeartbeat.After(contact) {
+		contact = h.LastHeartbeat
+	}
+	switch h.UPAXStatus {
+	case "active", "unknown":
+		fmt.Println("  UPAX:     connected")
+	case "pending":
+		fmt.Println("  UPAX:     waiting for activation (HR > Devices in UPAX); punches stay on the device until then")
+	case "paused":
+		fmt.Println("  UPAX:     paused in UPAX; punches stay on the device until it is resumed")
+	case "rejected":
+		fmt.Println("  UPAX:     the device address was rejected; check it in UPAX and run setup again")
+	default:
+		fmt.Println("  UPAX:     not reached yet")
+	}
+	fmt.Println("  contact: ", ago(contact))
+	fmt.Printf("  uploaded:  %d punches, last %s\n", h.Uploaded, ago(h.LastUpload))
+	if h.Pending > 0 {
+		fmt.Printf("  pending:   %d punches\n", h.Pending)
+	}
+	if h.LastError != "" && h.LastErrorAt.After(contact) {
+		fmt.Printf("  error:     %s (%s)\n", h.LastError, ago(h.LastErrorAt))
+	}
+	if running && time.Since(h.UpdatedAt) > 5*time.Minute {
+		fmt.Printf("  warning:   no update from the service for %s; see the log\n", time.Since(h.UpdatedAt).Round(time.Second))
+	}
+}
+
+func ago(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return fmt.Sprintf("%s (%s ago)", t.Local().Format(time.DateTime), time.Since(t).Round(time.Second))
+}
+
+func adminWord() string {
+	if runtime.GOOS == "windows" {
+		return "an administrator terminal"
+	}
+	return "sudo"
 }
 
 // ---- logging -----------------------------------------------------------------

@@ -30,6 +30,17 @@ func TestChecksumMatchesPyzk(t *testing.T) {
 	}
 }
 
+// TestFrameMatchesPyzk pins the TCP envelope to bytes captured from pyzk
+// talking to a real K14 Pro. zksim shares the constants, so only a fixed
+// expectation like this one catches a wrong magic.
+func TestFrameMatchesPyzk(t *testing.T) {
+	enc, _ := zk.EncodePacket(zk.CmdConnect, 0, 65534, nil)
+	want := []byte{0x50, 0x50, 0x82, 0x7d, 0x08, 0, 0, 0, 0xe8, 0x03, 0x17, 0xfc, 0, 0, 0, 0}
+	if got := zk.Frame(enc); string(got) != string(want) {
+		t.Fatalf("frame % x, want % x", got, want)
+	}
+}
+
 func TestTimeRoundTrip(t *testing.T) {
 	in := time.Date(2026, 10, 28, 17, 4, 59, 0, time.UTC)
 	if got := zk.DecodeTime(zk.EncodeTime(in)); !got.Equal(in) {
@@ -97,5 +108,71 @@ func TestPassword(t *testing.T) {
 	_, err := zk.Dial(context.Background(), addr, 1, time.Second)
 	if !errors.Is(err, zk.ErrUnauthorized) {
 		t.Fatalf("wrong password: err = %v", err)
+	}
+}
+
+func TestAttendanceRetriesWhenPunchLandsMidRead(t *testing.T) {
+	d := zksim.New("RACE")
+	base := time.Date(2026, 1, 2, 8, 0, 0, 0, time.UTC)
+	d.Punch("1", base, 1, 0)
+	once := false
+	d.BeforeAttLogRead = func() {
+		if !once {
+			once = true
+			d.Punch("2", base.Add(time.Minute), 1, 0)
+		}
+	}
+	c := dial(t, d, 0)
+	recs, err := c.Attendance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 2 || recs[0].UserID != "1" || recs[1].UserID != "2" {
+		t.Fatalf("got %+v", recs)
+	}
+}
+
+func TestSetAndDeleteUser(t *testing.T) {
+	d := zksim.New("USERS")
+	d.AddUser("7", "Old Name", 14)
+	c := dial(t, d, 0)
+
+	if err := c.SetUser("42", "Mona Ali", 0); err != nil {
+		t.Fatal(err)
+	}
+	if name, pri, ok := d.User("42"); !ok || name != "Mona Ali" || pri != 0 {
+		t.Fatalf("new user = %q %d %v", name, pri, ok)
+	}
+	// renaming an administrator keeps them an administrator
+	if err := c.SetUser("7", "New Name", 0); err != nil {
+		t.Fatal(err)
+	}
+	if name, pri, _ := d.User("7"); name != "New Name" || pri != 14 {
+		t.Fatalf("admin = %q %d", name, pri)
+	}
+	users, err := c.Users()
+	if err != nil || len(users) != 2 {
+		t.Fatalf("users = %+v, %v", users, err)
+	}
+
+	if err := c.DeleteUser("42"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := d.User("42"); ok {
+		t.Fatal("user 42 still on the device")
+	}
+	if err := c.DeleteUser("404"); err != nil {
+		t.Fatalf("deleting an unknown PIN: %v", err)
+	}
+}
+
+func TestSetUserOnEmptyDevice(t *testing.T) {
+	d := zksim.New("EMPTY")
+	c := dial(t, d, 0)
+	if err := c.SetUser("1", "First", 0); err != nil {
+		t.Fatal(err)
+	}
+	if name, _, ok := d.User("1"); !ok || name != "First" {
+		t.Fatalf("user = %q %v", name, ok)
 	}
 }

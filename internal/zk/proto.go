@@ -16,9 +16,11 @@ import (
 
 const (
 	CmdDBRRQ          = 7
+	CmdUserWRQ        = 8
 	CmdUserTempRRQ    = 9
 	CmdOptionsRRQ     = 11
 	CmdOptionsWRQ     = 12
+	CmdDeleteUser     = 18
 	CmdAttLogRRQ      = 13
 	CmdGetFreeSizes   = 50
 	CmdGetTime        = 201
@@ -48,7 +50,7 @@ const (
 	FctUser           = 5
 	ushrtMax          = 65535
 	tcpMagic1         = 0x5050
-	tcpMagic2         = 0x7282
+	tcpMagic2         = 0x7d82 // 32130, pyzk MACHINE_PREPARE_DATA_2
 	tcpHeaderSize     = 8
 	packetHeaderSize  = 8
 	maxPacketSize     = 16 << 20

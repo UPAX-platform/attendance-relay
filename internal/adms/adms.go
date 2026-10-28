@@ -28,8 +28,23 @@ type Options struct {
 	ATTLOGStamp int64
 	TransFlag   string
 	Realtime    bool
-	Raw         map[string]string
+	// Status is the device's state in UPAX (StatusActive, StatusPending,
+	// StatusPaused), or "" when the platform does not report it.
+	Status string
+	Raw    map[string]string
 }
+
+// Device states reported in the handshake's UPAXStatus line. UPAX adds that
+// line only for clients that send UPAXRelay=1, so terminals never see it.
+const (
+	StatusActive  = "active"
+	StatusPending = "pending" // not yet activated by an admin
+	StatusPaused  = "paused"
+)
+
+// Active reports whether UPAX will accept punches. An unknown status counts
+// as active: the upload itself will say otherwise.
+func (o Options) Active() bool { return o.Status == "" || o.Status == StatusActive }
 
 // Command is a server-issued device command ("C:<id>:<cmd>").
 type Command struct {
@@ -68,6 +83,26 @@ func (e *StatusError) Error() string {
 func IsNotFound(err error) bool {
 	var se *StatusError
 	return errors.As(err, &se) && se.Code == http.StatusNotFound
+}
+
+// IsRejected reports a refusal that retrying soon won't fix (a 4xx other
+// than 404, 408 and 429), such as an invalid serial or an oversized body.
+func IsRejected(err error) bool {
+	var se *StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.Code {
+	case http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	}
+	return se.Code/100 == 4
+}
+
+// IsUnavailable reports a 503: UPAX is busy, or the device is not active.
+func IsUnavailable(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.Code == http.StatusServiceUnavailable
 }
 
 // Client talks to one device address on the platform.
@@ -118,9 +153,14 @@ func (c *Client) do(ctx context.Context, method, u string, body string) (string,
 	return string(b), nil
 }
 
-// Handshake announces the device and fetches its options.
-func (c *Client) Handshake(ctx context.Context) (Options, error) {
-	q := url.Values{"options": {"all"}, "pushver": {"2.4.1"}, "language": {"69"}}
+// Handshake announces the device and fetches its options. info is the
+// optional INFO= summary (see GetRequest); sending it here lets UPAX show the
+// firmware on a device waiting for activation.
+func (c *Client) Handshake(ctx context.Context, info string) (Options, error) {
+	q := url.Values{"options": {"all"}, "pushver": {"2.4.1"}, "language": {"69"}, "UPAXRelay": {"1"}}
+	if info != "" {
+		q.Set("INFO", info)
+	}
 	body, err := c.do(ctx, http.MethodGet, c.url("/iclock/cdata", q), "")
 	if err != nil {
 		return Options{}, err
@@ -149,6 +189,8 @@ func (c *Client) Handshake(ctx context.Context) (Options, error) {
 			o.TransFlag = v
 		case "Realtime":
 			o.Realtime = n == 1
+		case "UPAXStatus":
+			o.Status = v
 		}
 	}
 	return o, nil
@@ -170,10 +212,20 @@ func FormatAttLog(recs []AttLog) string {
 
 // PushAttLog uploads attendance lines. stamp is the device-side position of
 // the last record in the batch, echoed back by the platform as ATTLOGStamp.
+//
+// UPAX answers an accepted batch with "OK: <lines>". A bare "OK" means the
+// table was dropped (a device not configured for ATTLOG), so anything but the
+// exact count is an error and the batch counts as not sent.
 func (c *Client) PushAttLog(ctx context.Context, stamp int64, recs []AttLog) error {
 	q := url.Values{"table": {"ATTLOG"}, "Stamp": {strconv.FormatInt(stamp, 10)}}
-	_, err := c.do(ctx, http.MethodPost, c.url("/iclock/cdata", q), FormatAttLog(recs))
-	return err
+	body, err := c.do(ctx, http.MethodPost, c.url("/iclock/cdata", q), FormatAttLog(recs))
+	if err != nil {
+		return err
+	}
+	if got := strings.TrimSpace(body); got != "OK: "+strconv.Itoa(len(recs)) {
+		return fmt.Errorf("upax: upload of %d punches not accepted (reply %q)", len(recs), got)
+	}
+	return nil
 }
 
 // GetRequest is the heartbeat. info is the optional INFO= summary

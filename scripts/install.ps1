@@ -28,6 +28,14 @@ New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     Write-Host "Downloading $name ..."
     Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/$name.zip" -OutFile "$tmp\relay.zip"
+    Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/checksums.txt" -OutFile "$tmp\checksums.txt"
+    $want = Get-Content "$tmp\checksums.txt" | ForEach-Object {
+        $f = $_ -split '\s+', 2
+        if ($f.Count -eq 2 -and $f[1].TrimStart('*') -eq "$name.zip") { $f[0] }
+    } | Select-Object -First 1
+    if (-not $want) { throw "checksums.txt has no entry for $name.zip" }
+    $got = (Get-FileHash -Algorithm SHA256 "$tmp\relay.zip").Hash
+    if ($got -ne $want) { throw "Checksum mismatch for $name.zip; the download is corrupt or was tampered with." }
     Expand-Archive -Path "$tmp\relay.zip" -DestinationPath $tmp -Force
 
     $exe = Join-Path $InstallDir 'upax-relay.exe'

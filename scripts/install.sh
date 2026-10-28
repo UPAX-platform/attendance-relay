@@ -36,12 +36,30 @@ name="upax-relay_${os}_${arch}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+fetch() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$1" -o "$2"
+  else
+    wget -qO "$2" "$1"
+  fi
+}
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    die "need sha256sum or shasum to verify the download"
+  fi
+}
+
 say "Downloading $name ..."
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$BASE_URL/$name.tar.gz" -o "$tmp/relay.tgz"
-else
-  wget -qO "$tmp/relay.tgz" "$BASE_URL/$name.tar.gz"
-fi
+fetch "$BASE_URL/$name.tar.gz" "$tmp/relay.tgz"
+fetch "$BASE_URL/checksums.txt" "$tmp/checksums.txt"
+want="$(awk -v f="$name.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "$tmp/checksums.txt")"
+[ -n "$want" ] || die "checksums.txt has no entry for $name.tar.gz"
+[ "$(sha256 "$tmp/relay.tgz")" = "$want" ] || die "checksum mismatch for $name.tar.gz; the download is corrupt or was tampered with"
 tar -xzf "$tmp/relay.tgz" -C "$tmp"
 
 $SUDO mkdir -p "$BIN_DIR"

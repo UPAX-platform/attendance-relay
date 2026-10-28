@@ -31,29 +31,65 @@ type Device struct {
 	// ChunkSize, if > 0, splits buffered data into several CMD_DATA packets
 	// to exercise multi-packet reads.
 	ChunkSize int
+	// BeforeAttLogRead, if set, runs just before the attendance table is
+	// snapshotted for a download, e.g. to land a punch mid-read.
+	BeforeAttLogRead func()
 
 	mu       sync.Mutex
 	punches  []punch
-	users    map[string]int
+	users    map[string]*simUser
 	restarts int
 	ln       net.Listener
 }
 
+type simUser struct {
+	uid  int
+	name string
+	pri  int
+}
+
 // New returns a simulator with no records.
 func New(serial string) *Device {
-	return &Device{Serial: serial, Firmware: "Ver 6.60 Apr 28 2017", users: map[string]int{}}
+	return &Device{Serial: serial, Firmware: "Ver 6.60 Apr 28 2017", users: map[string]*simUser{}}
+}
+
+// AddUser enrols a user, as if done in the device menu.
+func (d *Device) AddUser(userID, name string, privilege int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	u := d.userLocked(userID)
+	u.name, u.pri = name, privilege
+}
+
+// User reports an enrolled user's name and privilege.
+func (d *Device) User(userID string) (name string, privilege int, ok bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	u, ok := d.users[userID]
+	if !ok {
+		return "", 0, false
+	}
+	return u.name, u.pri, true
+}
+
+func (d *Device) userLocked(userID string) *simUser {
+	u, ok := d.users[userID]
+	if !ok {
+		maxUID := 0
+		for _, o := range d.users {
+			maxUID = max(maxUID, o.uid)
+		}
+		u = &simUser{uid: maxUID + 1, name: "User " + userID}
+		d.users[userID] = u
+	}
+	return u
 }
 
 // Punch appends an attendance record, as if someone used the device.
 func (d *Device) Punch(userID string, t time.Time, verify, state int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	uid, ok := d.users[userID]
-	if !ok {
-		uid = len(d.users) + 1
-		d.users[userID] = uid
-	}
-	d.punches = append(d.punches, punch{uid, userID, t, verify, state})
+	d.punches = append(d.punches, punch{d.userLocked(userID).uid, userID, t, verify, state})
 }
 
 // ClearLog wipes the attendance log (like "Delete attendance logs" in the menu).
@@ -187,6 +223,9 @@ func (d *Device) serve(conn net.Conn) {
 			}
 			switch le.Uint16(p.Data[1:]) {
 			case zk.CmdAttLogRRQ:
+				if d.BeforeAttLogRead != nil {
+					d.BeforeAttLogRead()
+				}
 				pending = d.attData()
 			case zk.CmdUserTempRRQ:
 				pending = d.userData()
@@ -223,6 +262,20 @@ func (d *Device) serve(conn net.Conn) {
 			}
 		case zk.CmdFreeData:
 			pending = nil
+			err = write(zk.CmdAckOK, r, nil)
+		case zk.CmdUserWRQ:
+			if len(p.Data) != 72 {
+				err = write(zk.CmdAckError, r, nil)
+				break
+			}
+			d.writeUser(p.Data)
+			err = write(zk.CmdAckOK, r, nil)
+		case zk.CmdDeleteUser:
+			if len(p.Data) < 2 {
+				err = write(zk.CmdAckError, r, nil)
+				break
+			}
+			d.deleteUser(int(le.Uint16(p.Data)))
 			err = write(zk.CmdAckOK, r, nil)
 		case zk.CmdRestart:
 			d.mu.Lock()
@@ -263,12 +316,45 @@ func (d *Device) userData() []byte {
 	defer d.mu.Unlock()
 	out := make([]byte, 4, 4+72*len(d.users))
 	le.PutUint32(out, uint32(72*len(d.users)))
-	for id, uid := range d.users {
+	for id, u := range d.users {
 		rec := make([]byte, 72)
-		le.PutUint16(rec, uint16(uid))
-		copy(rec[11:35], "User "+id)
+		le.PutUint16(rec, uint16(u.uid))
+		rec[2] = byte(u.pri)
+		copy(rec[11:35], u.name)
 		copy(rec[48:72], id)
 		out = append(out, rec...)
 	}
 	return out
+}
+
+// writeUser stores a 72-byte CMD_USER_WRQ record, keyed by its PIN.
+func (d *Device) writeUser(rec []byte) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	uid, id := int(le.Uint16(rec)), cstr(rec[48:72])
+	for other, u := range d.users {
+		if u.uid == uid && other != id {
+			delete(d.users, other)
+		}
+	}
+	d.users[id] = &simUser{uid: uid, name: cstr(rec[11:35]), pri: int(rec[2])}
+}
+
+func (d *Device) deleteUser(uid int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, u := range d.users {
+		if u.uid == uid {
+			delete(d.users, id)
+		}
+	}
+}
+
+func cstr(b []byte) string {
+	for i, c := range b {
+		if c == 0 {
+			return string(b[:i])
+		}
+	}
+	return string(b)
 }

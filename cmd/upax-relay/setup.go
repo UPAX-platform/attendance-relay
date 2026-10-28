@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/UPAX-platform/zk-relay/internal/adms"
 	"github.com/UPAX-platform/zk-relay/internal/config"
+	"github.com/UPAX-platform/zk-relay/internal/relay"
 	"github.com/UPAX-platform/zk-relay/internal/zk"
 )
 
@@ -75,9 +77,25 @@ func probeDevice(ctx context.Context, d config.Device) (deviceInfo, error) {
 	return in, nil
 }
 
-func probeUPAX(ctx context.Context, url, serial string) (adms.Options, error) {
-	ac := &adms.Client{Base: url, SN: serial, UserAgent: "upax-zk-relay/" + version}
-	return ac.Handshake(ctx)
+// probeUPAX handshakes as the device. It carries the device summary, so a
+// device UPAX hasn't activated yet shows its firmware next to the serial.
+func probeUPAX(ctx context.Context, url string, d config.Device, in deviceInfo) (adms.Options, error) {
+	ac := &adms.Client{Base: url, SN: in.serial, UserAgent: "upax-zk-relay/" + version}
+	info := fmt.Sprintf("%s,%d,%d,%d,%s", in.firmware, in.sizes.Users, in.sizes.Fingers, in.sizes.Records, d.Host)
+	return ac.Handshake(ctx, info)
+}
+
+// describeStatus explains a device's UPAX status in one line.
+func describeStatus(o adms.Options, serial string) string {
+	switch o.Status {
+	case adms.StatusActive:
+		return "active, UPAX accepts punches from this device"
+	case adms.StatusPending:
+		return fmt.Sprintf("waiting for activation: open HR > Devices in UPAX and activate the device with serial %s. Punches stay on the device until then", serial)
+	case adms.StatusPaused:
+		return "paused in UPAX: resume the device there to upload punches"
+	}
+	return "ok"
 }
 
 func splitHostPort(s string) (string, int) {
@@ -94,7 +112,7 @@ func cmdSetup(args []string) error {
 	dev := fs.String("device", "", "device IP or host[:port]")
 	pw := fs.Uint("password", 0, "device communication password (comm key), if one is set")
 	name := fs.String("name", "", "friendly name for the device")
-	backfill := fs.String("backfill", "", "first run: upload stored history (all) or only new punches (none)")
+	backfill := fs.String("backfill", "", "first run: upload stored history (all), only new punches (none), or history from a date (since:YYYY-MM-DD)")
 	install := fs.String("install", "ask", "install and start the background service: yes, no or ask")
 	_ = fs.Parse(args)
 	ctx := context.Background()
@@ -183,8 +201,12 @@ func cmdSetup(args []string) error {
 	if err := config.ValidateURL(u); err != nil {
 		return err
 	}
+	if existing != "" && existing != u {
+		fmt.Println("  This device was set up with a different UPAX address. If the new address is a new")
+		fmt.Println("  device in UPAX, the relay uploads the device's punches to it again (see backfill).")
+	}
 	fmt.Printf("\nChecking UPAX ... ")
-	opts, err := probeUPAX(ctx, u, info.serial)
+	opts, err := probeUPAX(ctx, u, d, info)
 	if err != nil {
 		fmt.Println("failed")
 		if adms.IsNotFound(err) {
@@ -193,8 +215,9 @@ func cmdSetup(args []string) error {
 		return fmt.Errorf("could not reach UPAX: %w", err)
 	}
 	fmt.Println("ok")
+	fmt.Println("  " + describeStatus(opts, info.serial))
 	if opts.ATTLOGStamp > 0 {
-		fmt.Printf("  UPAX already has punches from this device (stamp %d); the relay will continue from there.\n", opts.ATTLOGStamp)
+		fmt.Println("  UPAX already has punches from this device; any the relay re-sends are skipped there.")
 	}
 	d.UpaxURL = u
 
@@ -202,11 +225,16 @@ func cmdSetup(args []string) error {
 	if *backfill != "" {
 		cfg.Backfill = *backfill
 	} else if info.sizes.Records > 0 && opts.ATTLOGStamp == 0 && isTTY() {
-		fmt.Printf("\nThe device holds %d past punches.\n", info.sizes.Records)
-		if yes("Upload them to UPAX on first start?", true) {
-			cfg.Backfill = "all"
-		} else {
-			cfg.Backfill = "none"
+		fmt.Printf("\nThe device holds %d past punches. Upload them to UPAX on first start?\n", info.sizes.Records)
+		fmt.Println("  all = every stored punch, none = only new punches, since:YYYY-MM-DD = from that date")
+		for {
+			b := prompt("Upload", "all")
+			if err := config.ValidateBackfill(b); err != nil {
+				fmt.Println(" ", err)
+				continue
+			}
+			cfg.Backfill = b
+			break
 		}
 	}
 
@@ -234,12 +262,50 @@ func cmdSetup(args []string) error {
 		fmt.Printf("\nInstall and start the service later with:  upax-relay install --config %q && upax-relay start\n", cfg.Path())
 		return nil
 	}
+	started := time.Now()
 	if err := installAndStart(cfg.Path()); err != nil {
 		return err
 	}
-	fmt.Println("\nDone. The relay is running and will start automatically at boot.")
+	if err := waitForService(cfg, d, started); err != nil {
+		return err
+	}
+	fmt.Println("\nDone. The relay runs in the background and starts automatically at boot.")
 	fmt.Println("Check on it any time with:  upax-relay status")
 	return nil
+}
+
+// waitForService waits for the freshly started service to reach UPAX for d,
+// so setup reports what actually happened rather than that it started.
+func waitForService(cfg *config.Config, d config.Device, since time.Time) error {
+	fmt.Print("\nWaiting for the relay service to reach UPAX ... ")
+	path := relay.HealthPath(cfg.StateDir(), d.Addr())
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		h, err := relay.LoadHealth(path)
+		fresh := err == nil && h.StartedAt.After(since)
+		switch {
+		case fresh && h.LastHandshake.After(since):
+			fmt.Println("ok")
+			status := h.UPAXStatus
+			if status == "unknown" {
+				status = ""
+			}
+			fmt.Println("  " + describeStatus(adms.Options{Status: status}, h.Serial))
+			return nil
+		case fresh && h.UPAXStatus == "rejected":
+			fmt.Println("failed")
+			return errors.New("UPAX rejected the device address; check it in UPAX and run setup again")
+		case time.Now().After(deadline):
+			fmt.Println("no contact")
+			if fresh && h.LastError != "" {
+				fmt.Println("  last error:", h.LastError)
+			} else if !fresh {
+				fmt.Println("  the service has not started; check the system log, or run \"upax-relay run\" to see why")
+			}
+			return fmt.Errorf("the relay service has not reached UPAX yet; see %s", filepath.Join(cfg.StateDir(), "relay.log"))
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 func warnClock(t time.Time) {
@@ -282,13 +348,15 @@ func cmdTest(args []string) error {
 			sn = d.Serial
 		}
 		fmt.Printf("  UPAX %s ... ", cfg.URLFor(d))
-		opts, err := probeUPAX(ctx, cfg.URLFor(d), sn)
+		info.serial = sn
+		opts, err := probeUPAX(ctx, cfg.URLFor(d), d, info)
 		if err != nil {
 			fmt.Println("FAILED:", err)
 			failed = true
 			continue
 		}
-		fmt.Printf("ok (heartbeat %s, stamp %d, transfers %q)\n", opts.Delay, opts.ATTLOGStamp, opts.TransFlag)
+		fmt.Printf("ok (heartbeat %s, transfers %q)\n", opts.Delay, opts.TransFlag)
+		fmt.Println("  " + describeStatus(opts, sn))
 	}
 	if failed {
 		return errors.New("some checks failed")

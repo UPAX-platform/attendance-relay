@@ -51,7 +51,8 @@ type Config struct {
 	UpaxURL string   `yaml:"upax_url,omitempty"`
 	Devices []Device `yaml:"devices"`
 	// Backfill controls what happens the first time a device is seen:
-	// "all" uploads the device's stored history, "none" only new punches.
+	// "all" uploads the device's stored history, "none" only new punches,
+	// "since:YYYY-MM-DD" only stored punches on/after that date.
 	Backfill string `yaml:"backfill,omitempty"`
 	// PollInterval is how often the device is checked for new punches.
 	PollInterval Duration `yaml:"poll_interval,omitempty"`
@@ -147,8 +148,8 @@ func (c *Config) Validate() error {
 	if len(c.Devices) == 0 {
 		errs = append(errs, errors.New("no devices configured"))
 	}
-	if c.Backfill != "all" && c.Backfill != "none" {
-		errs = append(errs, fmt.Errorf("backfill must be \"all\" or \"none\", got %q", c.Backfill))
+	if err := ValidateBackfill(c.Backfill); err != nil {
+		errs = append(errs, err)
 	}
 	urls := map[string]string{}
 	for i, d := range c.Devices {
@@ -165,6 +166,18 @@ func (c *Config) Validate() error {
 		urls[u] = d.Label()
 	}
 	return errors.Join(errs...)
+}
+
+// ValidateBackfill checks a backfill setting: all, none or since:YYYY-MM-DD.
+func ValidateBackfill(s string) error {
+	if s == "all" || s == "none" {
+		return nil
+	}
+	d, ok := strings.CutPrefix(s, "since:")
+	if _, err := time.Parse(time.DateOnly, d); !ok || err != nil {
+		return fmt.Errorf("backfill must be \"all\", \"none\" or \"since:YYYY-MM-DD\", got %q", s)
+	}
+	return nil
 }
 
 // ValidateURL checks a UPAX device address.
