@@ -56,6 +56,8 @@ const (
 	packetHeaderSize  = 8
 	maxPacketSize     = 16 << 20
 	maxBufferedChunk  = 0xFFC0
+	maxBufferedSize   = 256 << 20 // a whole table: far beyond any terminal's capacity
+	maxEventsSkipped  = 1000
 	initialReplyID    = ushrtMax - 1
 	attRecordSize40   = 40
 	attRecordSize16   = 16
@@ -199,7 +201,10 @@ func EncodeTime(t time.Time) uint32 {
 }
 
 // DecodeTimeHex decodes the 6-byte (YY MM DD hh mm ss) time used by
-// real-time events.
+// real-time events; a shorter b gives the zero time.
 func DecodeTimeHex(b []byte) time.Time {
+	if len(b) < 6 {
+		return time.Time{}
+	}
 	return time.Date(2000+int(b[0]), time.Month(b[1]), int(b[2]), int(b[3]), int(b[4]), int(b[5]), 0, time.UTC)
 }

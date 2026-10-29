@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/UPAX-platform/attendance-relay/internal/atomicfile"
 	"github.com/UPAX-platform/attendance-relay/internal/device"
 	"github.com/UPAX-platform/attendance-relay/internal/push"
 	"github.com/UPAX-platform/attendance-relay/internal/upax"
@@ -51,11 +52,7 @@ func (p *pushTerm) metaPath() string { return filepath.Join(p.spool.Dir(), "meta
 
 func (p *pushTerm) saveMeta() error {
 	b, _ := json.MarshalIndent(p.meta, "", "  ")
-	tmp := p.metaPath() + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, p.metaPath())
+	return atomicfile.Write(p.metaPath(), b, 0o600)
 }
 
 // loadSpools picks up push terminals from earlier runs, so what they left
@@ -333,12 +330,22 @@ func (p *pushTerm) uploader(ctx context.Context) {
 		if open, _ := p.gate(); !open || time.Now().Before(retryAfter) || p.spool.Pending() == 0 {
 			continue
 		}
-		if wait, err := p.drain(ctx); err != nil {
+		if wait, err := p.safeDrain(ctx); err != nil {
 			retryAfter = time.Now().Add(wait)
 			p.r.log.Warn("upload of spooled punches failed; will retry", "serial", p.serial, "err", err, "spooled", p.spool.Pending(), "retry_in", wait)
 			p.health.fail(err)
 		}
 	}
+}
+
+func (p *pushTerm) safeDrain(ctx context.Context) (wait time.Duration, err error) {
+	defer func() {
+		if err != nil && wait <= 0 {
+			wait = time.Minute
+		}
+	}()
+	defer recovered(p.r.log.With("serial", p.serial), "push upload", &err)
+	return p.drain(ctx)
 }
 
 func (p *pushTerm) drain(ctx context.Context) (time.Duration, error) {

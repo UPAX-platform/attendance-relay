@@ -2,6 +2,7 @@ package relay
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/UPAX-platform/attendance-relay/internal/atomicfile"
 	"github.com/UPAX-platform/attendance-relay/internal/device"
 )
 
@@ -48,11 +50,18 @@ func loadState(dir, serial string) (*State, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(b, s); err != nil {
-		return nil, fmt.Errorf("corrupt state file %s: %w", s.path, err)
+	if err := json.Unmarshal(b, s); err != nil || s.Count < 0 {
+		// Don't stop the terminal over it: put the file aside and start over
+		// as if the log had been cleared. Re-sending is safe (UPAX skips the
+		// punches it has); applying backfill again could skip some.
+		_ = os.Rename(s.path, s.path+".corrupt")
+		return &State{Serial: serial, Initialized: true, path: s.path}, errCorruptState
 	}
 	return s, nil
 }
+
+// errCorruptState comes with a usable fresh state.
+var errCorruptState = errors.New("the terminal's state file was unreadable; it was set aside and the terminal's log is re-sent")
 
 // LoadStateFile reads a state file for display.
 func LoadStateFile(path string) (*State, error) {
@@ -69,11 +78,7 @@ func (s *State) save() error {
 		return err
 	}
 	b, _ := json.MarshalIndent(s, "", "  ")
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return atomicfile.Write(s.path, b, 0o644)
 }
 
 func (s *State) markUploaded(pos int, r device.Punch) {
@@ -130,7 +135,7 @@ func plan(recs []device.Punch, st *State, backfill string) (idx []int, note stri
 		return from(start), note
 	}
 
-	if st.Count == 0 {
+	if st.Count <= 0 {
 		return from(0), ""
 	}
 	if st.Count <= n && recordKey(recs[st.Count-1]) == st.LastKey {

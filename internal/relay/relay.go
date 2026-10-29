@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -41,6 +42,9 @@ const (
 	keyMaxAge        = 365 * 24 * time.Hour
 	keyPrevGrace     = 24 * time.Hour
 	maxQueuedResults = 1000
+	// maxDelay caps the waits UPAX asks for, so a bad value can't park the
+	// relay for good.
+	maxDelay = time.Hour
 )
 
 // Options configure a Relay. Zero test knobs take the defaults.
@@ -165,19 +169,49 @@ func (r *Relay) startListener(ctx context.Context) {
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		var err error
 		if r.o.PushListener != nil {
-			err = srv.Serve(ctx, r.o.PushListener)
-		} else {
-			err = srv.Run(ctx)
+			if err := srv.Serve(ctx, r.o.PushListener); err != nil {
+				r.listenerFailed(err, 0)
+			}
+			return
 		}
-		if err != nil {
-			r.log.Error("push listener stopped; push terminals can't reach the relay", "bind", r.cfg.Listener.Bind, "err", err)
-			r.health.fail(fmt.Errorf("push listener: %w", err))
+		// The port may be taken for a while (an old instance still
+		// stopping): keep trying rather than give push terminals up.
+		backoff := r.o.MinBackoff
+		for {
+			err := srv.Run(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			r.listenerFailed(err, backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, r.o.MaxBackoff)
 		}
 	}()
 	r.health.update(func(h *RelayHealth) { h.Listener = r.cfg.Listener.Bind })
 	r.log.Info("push listener started; point push terminals' cloud server at this computer", "bind", r.cfg.Listener.Bind)
+}
+
+func (r *Relay) listenerFailed(err error, retryIn time.Duration) {
+	if err == nil {
+		err = errors.New("stopped")
+	}
+	r.log.Error("push listener stopped; push terminals can't reach the relay", "bind", r.cfg.Listener.Bind, "err", err, "retry_in", retryIn)
+	r.health.fail(fmt.Errorf("push listener: %w", err))
+}
+
+// recovered turns a panic into *err, so one bad terminal or reply can't
+// take the service down; the stack goes to the log. Use it as
+// defer recovered(log, "what", &err).
+func recovered(log *slog.Logger, what string, err *error) {
+	if p := recover(); p != nil {
+		log.Error(what+" failed unexpectedly; carrying on", "panic", p, "stack", string(debug.Stack()))
+		*err = fmt.Errorf("internal error in %s: %v", what, p)
+	}
 }
 
 // kick wakes the sync loop: results to send, or a terminal to report.
@@ -252,7 +286,7 @@ func (r *Relay) syncLoop(ctx context.Context) {
 			}
 		}
 		lastSync = time.Now()
-		wait, failed := r.syncOnce(ctx)
+		wait, failed := r.safeSync(ctx)
 		switch {
 		case !failed:
 			backoff = r.o.MinBackoff
@@ -266,6 +300,18 @@ func (r *Relay) syncLoop(ctx context.Context) {
 		}
 		timer.Reset(wait)
 	}
+}
+
+// safeSync is syncOnce, with a panic taken as a failed sync.
+func (r *Relay) safeSync(ctx context.Context) (wait time.Duration, failed bool) {
+	var err error
+	defer func() {
+		if err != nil {
+			wait, failed = 0, true
+		}
+	}()
+	defer recovered(r.log, "sync", &err)
+	return r.syncOnce(ctx)
 }
 
 // syncOnce runs one sync and returns when to run the next. failed with
@@ -282,7 +328,7 @@ func (r *Relay) syncOnce(ctx context.Context) (wait time.Duration, failed bool) 
 		return time.Second, true
 	}
 	if err != nil {
-		return r.syncFailed(err), true
+		return r.syncFailed(ctx, err), true
 	}
 	r.apply(rep)
 	r.flushResults(ctx)
@@ -291,7 +337,7 @@ func (r *Relay) syncOnce(ctx context.Context) (wait time.Duration, failed bool) 
 	return poll, false
 }
 
-func (r *Relay) syncFailed(err error) time.Duration {
+func (r *Relay) syncFailed(ctx context.Context, err error) time.Duration {
 	_, errDelay := r.delays()
 	e, isAPI := upax.AsError(err)
 	set := func(status string) (changed bool) {
@@ -314,13 +360,16 @@ func (r *Relay) syncFailed(err error) time.Duration {
 		r.log.Error("UPAX refused the relay's requests because this computer's clock is off by more than an hour; fix the clock (enable automatic time)", "measured_offset", off, "retry_in", r.o.SignatureBackoff)
 		return r.o.SignatureBackoff
 	case isAPI && e.Status == http.StatusUnauthorized:
+		// A rotation UPAX took but the relay didn't finish installing.
+		r.recoverRotation(ctx)
 		set(statusSignatureInvalid)
 		r.log.Error("UPAX refused the relay's signature; check that the relay's fingerprint matches the one in UPAX, or pair again", "fingerprint", identity.Group(r.fingerprint()), "code", e.Code, "retry_in", r.o.SignatureBackoff)
 		r.health.update(func(h *RelayHealth) { h.UPAXStatus = statusSignatureInvalid })
 		return r.o.SignatureBackoff
 	case isAPI && e.RetryAfter > 0:
-		r.log.Warn("UPAX is busy", "status", e.Status, "retry_in", e.RetryAfter)
-		return e.RetryAfter
+		wait := min(e.RetryAfter, maxDelay)
+		r.log.Warn("UPAX is busy", "status", e.Status, "retry_in", wait)
+		return wait
 	case isAPI:
 		r.log.Warn("sync refused by UPAX", "err", err, "retry_in", errDelay)
 		return errDelay
@@ -343,7 +392,7 @@ func seconds(n int, def time.Duration) time.Duration {
 	if n <= 0 {
 		return def
 	}
-	return time.Duration(n) * time.Second
+	return time.Duration(min(n, int(maxDelay/time.Second))) * time.Second
 }
 
 // apply hands the sync reply out: the relay's status, and each terminal's
@@ -446,6 +495,8 @@ func (r *Relay) addResult(res upax.Result) {
 }
 
 func (r *Relay) flushResults(ctx context.Context) {
+	var err error
+	defer recovered(r.log, "command results", &err)
 	r.mu.Lock()
 	rs := r.results
 	r.results = nil
@@ -526,7 +577,7 @@ func (r *Relay) uploadFailed(err error) uploadOutcome {
 		r.kick(true)
 		return uploadOutcome{wait: max(errDelay, r.o.SignatureBackoff)}
 	case e.RetryAfter > 0:
-		return uploadOutcome{wait: max(e.RetryAfter, time.Second)}
+		return uploadOutcome{wait: min(max(e.RetryAfter, time.Second), maxDelay)}
 	}
 	return uploadOutcome{wait: errDelay}
 }
@@ -574,9 +625,9 @@ func RotateKey(ctx context.Context, api *upax.Client, path string) (*identity.Ke
 		os.Remove(path + ".next")
 		return nil, err
 	}
-	if err := cur.Save(path + ".prev"); err != nil {
-		return nil, err
-	}
+	// UPAX has the new key now: install it even if the old one can't be
+	// kept (.prev is only a fallback).
+	_ = cur.Save(path + ".prev")
 	if err := os.Rename(path+".next", path); err != nil {
 		return nil, err
 	}

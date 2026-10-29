@@ -2,6 +2,7 @@ package push
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/UPAX-platform/attendance-relay/internal/atomicfile"
 	"github.com/UPAX-platform/attendance-relay/internal/device"
 )
 
@@ -45,12 +47,25 @@ func OpenSpool(dir string) (*Spool, error) {
 	}
 	for _, n := range names {
 		p, err := s.read(n)
+		if errors.Is(err, errCorrupt) {
+			s.quarantine(n)
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
 		s.pending += len(p)
 	}
 	return s, nil
+}
+
+// errCorrupt marks a spool file that can't be read back.
+var errCorrupt = errors.New("corrupt spool file")
+
+// quarantine sets an unreadable spool file aside (*.corrupt, kept for
+// inspection) so the files after it still go out.
+func (s *Spool) quarantine(name string) {
+	_ = os.Rename(name, strings.TrimSuffix(name, ".punches")+".corrupt")
 }
 
 // Dir is the spool's directory.
@@ -85,7 +100,7 @@ func (s *Spool) Append(punches []device.Punch) error {
 	}
 	s.last = id
 	name := filepath.Join(s.dir, fmt.Sprintf("%020d.punches", id))
-	if err := writeSynced(name, encode(punches)); err != nil {
+	if err := atomicfile.Write(name, encode(punches), 0o600); err != nil {
 		return err
 	}
 	s.pending += len(punches)
@@ -93,16 +108,29 @@ func (s *Spool) Append(punches []device.Punch) error {
 }
 
 // Oldest returns the oldest spool file and its punches; ok is false when
-// the spool is empty.
+// the spool is empty. Unreadable files are set aside, and empty ones
+// removed, on the way.
 func (s *Spool) Oldest() (name string, punches []device.Punch, ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	names, err := s.files()
-	if err != nil || len(names) == 0 {
+	if err != nil {
 		return "", nil, false, err
 	}
-	p, err := s.read(names[0])
-	return names[0], p, err == nil, err
+	for _, n := range names {
+		p, err := s.read(n)
+		switch {
+		case errors.Is(err, errCorrupt):
+			s.quarantine(n)
+		case err != nil:
+			return "", nil, false, err
+		case len(p) == 0:
+			_ = os.Remove(n)
+		default:
+			return n, p, true, nil
+		}
+	}
+	return "", nil, false, nil
 }
 
 // Done records that the first n punches of file name reached UPAX.
@@ -118,7 +146,7 @@ func (s *Spool) Done(name string, n int) error {
 	if n == len(p) {
 		return os.Remove(name)
 	}
-	return writeSynced(name, encode(p[n:]))
+	return atomicfile.Write(name, encode(p[n:]), 0o600)
 }
 
 func (s *Spool) read(name string) ([]device.Punch, error) {
@@ -128,13 +156,13 @@ func (s *Spool) read(name string) ([]device.Punch, error) {
 	}
 	var in []spoolPunch
 	if err := json.Unmarshal(b, &in); err != nil {
-		return nil, fmt.Errorf("corrupt spool file %s: %w", name, err)
+		return nil, fmt.Errorf("%w %s: %v", errCorrupt, name, err)
 	}
 	out := make([]device.Punch, 0, len(in))
 	for _, x := range in {
 		t, err := time.Parse(time.DateTime, x.Local)
 		if err != nil {
-			return nil, fmt.Errorf("corrupt spool file %s: %w", name, err)
+			return nil, fmt.Errorf("%w %s: %v", errCorrupt, name, err)
 		}
 		out = append(out, device.Punch{PIN: x.PIN, Time: t, State: x.State, Verify: x.Verify, WorkCode: x.WorkCode})
 	}
@@ -148,39 +176,6 @@ func encode(punches []device.Punch) []byte {
 	}
 	b, _ := json.Marshal(out)
 	return b
-}
-
-// writeSynced writes name atomically and durably: tmp file, fsync, rename,
-// fsync the directory.
-func writeSynced(name string, b []byte) error {
-	tmp := name + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, name); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if d, err := os.Open(filepath.Dir(name)); err == nil {
-		_ = d.Sync() // not supported on every platform (Windows); best effort
-		d.Close()
-	}
-	return nil
 }
 
 // SpoolDir is the spool directory for a push terminal's serial.

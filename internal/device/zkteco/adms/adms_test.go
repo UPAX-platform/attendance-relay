@@ -1,6 +1,7 @@
 package adms
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,5 +26,12 @@ func TestZoneOffset(t *testing.T) {
 		if got := zoneOffset(now, loc); got != want {
 			t.Errorf("%s: %s, want %s", name, got, want)
 		}
+	}
+}
+
+func TestParseGarbage(t *testing.T) {
+	for _, s := range []string{"", "\n\n", "\t\t\t", "1", "1\t", "\t2026-10-28 08:00:00", "x\ty\tz\tw\tv\tu", ",,,,", "\x00\xff\t\x00", strings.Repeat("9\t", 1000)} {
+		_, _ = ParseAttLog(s)
+		_ = parseInfo(s)
 	}
 }

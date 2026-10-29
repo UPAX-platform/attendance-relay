@@ -78,3 +78,40 @@ func TestSpool(t *testing.T) {
 		t.Fatalf("spool dir mode %v", fi.Mode().Perm())
 	}
 }
+
+func TestSpoolSkipsCorruptAndEmptyFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "spool-X")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"00000000000000000001.punches": "{not json",
+		"00000000000000000002.punches": `[{"pin":"1","local":"yesterday"}]`,
+		"00000000000000000003.punches": "null",
+		"00000000000000000004.punches": `[{"pin":"7","local":"2026-10-28 08:00:00","state":0,"verify":1,"workcode":"0"}]`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := OpenSpool(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Pending() != 1 {
+		t.Fatalf("pending %d, want 1", s.Pending())
+	}
+	name, got, ok, err := s.Oldest()
+	if err != nil || !ok || len(got) != 1 || got[0].PIN != "7" {
+		t.Fatalf("oldest %v %v %v", got, ok, err)
+	}
+	if err := s.Done(name, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := s.Oldest(); ok || err != nil {
+		t.Fatalf("spool not empty: %v %v", ok, err)
+	}
+	if m, _ := filepath.Glob(filepath.Join(dir, "*.corrupt")); len(m) != 2 {
+		t.Fatalf("set aside %v, want the 2 unreadable files", m)
+	}
+}

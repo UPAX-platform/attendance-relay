@@ -19,6 +19,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/UPAX-platform/attendance-relay/internal/atomicfile"
 	"github.com/UPAX-platform/attendance-relay/internal/device"
 	"github.com/UPAX-platform/attendance-relay/internal/upax"
 )
@@ -168,6 +169,8 @@ func (c *Config) applyDefaults() {
 	if c.PollInterval <= 0 {
 		c.PollInterval = Duration(5 * time.Second)
 	}
+	// Faster than once a second only hammers the terminals.
+	c.PollInterval = max(c.PollInterval, Duration(time.Second))
 	if c.Listener.Bind == "" {
 		c.Listener.Bind = DefaultListenerBind
 	}
@@ -281,13 +284,5 @@ func (c *Config) Save() error {
 		return err
 	}
 	header := "# UPAX attendance relay configuration. See README for all options.\n"
-	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, append([]byte(header), b...), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, c.path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
+	return atomicfile.Write(c.path, append([]byte(header), b...), 0o600)
 }

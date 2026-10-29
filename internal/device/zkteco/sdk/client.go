@@ -121,7 +121,7 @@ func (c *Client) command(cmd uint16, data []byte) (Packet, error) {
 	if err := c.send(cmd, data); err != nil {
 		return Packet{}, err
 	}
-	for {
+	for range maxEventsSkipped {
 		p, err := c.readPacket()
 		if err != nil {
 			return Packet{}, err
@@ -133,6 +133,7 @@ func (c *Client) command(cmd uint16, data []byte) (Packet, error) {
 		c.reply = p.Reply
 		return p, nil
 	}
+	return Packet{}, fmt.Errorf("zk: no answer to command %d among the device's events", cmd)
 }
 
 func (c *Client) ackEvent() {
@@ -283,6 +284,9 @@ func (c *Client) readBuffered(command uint16, fct, ext int32) ([]byte, error) {
 		return nil, fmt.Errorf("zk: buffered read not supported (response %d)", p.Cmd)
 	}
 	size := int(le.Uint32(p.Data[1:]))
+	if size > maxBufferedSize {
+		return nil, fmt.Errorf("zk: device announced a %d-byte table", size)
+	}
 	out := make([]byte, 0, size)
 	for start := 0; start < size; {
 		n := min(size-start, maxBufferedChunk)
@@ -319,6 +323,9 @@ func (c *Client) readChunk(start, size int) ([]byte, error) {
 			}
 			switch q.Cmd {
 			case CmdData:
+				if len(out)+len(q.Data) > size+maxBufferedChunk {
+					return nil, fmt.Errorf("zk: device sent more than the %d bytes asked for", size)
+				}
 				out = append(out, q.Data...)
 			case CmdAckOK:
 				return out, nil

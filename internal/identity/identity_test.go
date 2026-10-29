@@ -91,3 +91,25 @@ func TestPairingCode(t *testing.T) {
 		}
 	}
 }
+
+func TestSourceKeepsKeyWhenFileDamaged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.key")
+	k, err := Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := k.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	s := &Source{Path: path}
+	if _, err := s.Key(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("garbage, and longer than a key line"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Key()
+	if err != nil || got.Fingerprint() != k.Fingerprint() {
+		t.Fatalf("key %v, err %v", got, err)
+	}
+}

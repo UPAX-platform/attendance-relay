@@ -166,7 +166,7 @@ func (rd *reader) run(ctx context.Context) {
 	backoff := minB
 	for {
 		started := time.Now()
-		err := rd.session(ctx)
+		err := rd.safeSession(ctx)
 		if ctx.Err() != nil {
 			return
 		}
@@ -195,6 +195,13 @@ func (rd *reader) run(ctx context.Context) {
 		}
 		backoff = min(backoff*2, maxB)
 	}
+}
+
+// safeSession is session, with a panic (a terminal answering something the
+// driver didn't expect) ending the session instead of the relay.
+func (rd *reader) safeSession(ctx context.Context) (err error) {
+	defer recovered(rd.log, "terminal session", &err)
+	return rd.session(ctx)
 }
 
 // session is one connection to the terminal.
@@ -276,7 +283,9 @@ func (rd *reader) session(ctx context.Context) error {
 	}
 
 	st, err := loadState(rd.r.cfg.StateDir(), info.Serial)
-	if err != nil {
+	if errors.Is(err, errCorruptState) {
+		rd.log.Warn(err.Error(), "serial", info.Serial)
+	} else if err != nil {
 		return err
 	}
 	rd.health.update(func(h *TerminalHealth) { h.Uploaded = st.Uploaded })

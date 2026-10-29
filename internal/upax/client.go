@@ -92,6 +92,10 @@ type Client struct {
 // broken clock to fix, not to paper over.
 const maxOffset = time.Hour
 
+// maxRetryAfter (seconds) bounds a Retry-After, so a bad header can't
+// overflow the duration.
+const maxRetryAfter = 24 * 60 * 60
+
 var relayIDRe = regexp.MustCompile(`^[0-9a-z]{26}$`)
 
 // ValidateBase checks a UPAX origin: https (http only for local
@@ -275,7 +279,7 @@ func (c *Client) send(ctx context.Context, u string, key *identity.Key, body []b
 			e.Code = eb.Code
 		}
 		if s, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && s > 0 {
-			e.RetryAfter = time.Duration(s) * time.Second
+			e.RetryAfter = time.Duration(min(s, maxRetryAfter)) * time.Second
 		}
 		return e
 	}

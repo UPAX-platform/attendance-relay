@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/UPAX-platform/attendance-relay/internal/atomicfile"
 )
 
 // Alphabet is the base32 alphabet of fingerprints and pairing codes: digits
@@ -113,20 +115,8 @@ func (k *Key) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
 	data := base64.StdEncoding.EncodeToString(k.priv.Seed()) + "\n"
-	if err := os.WriteFile(tmp, []byte(data), 0o600); err != nil {
-		return err
-	}
-	if err := restrict(tmp); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
+	return atomicfile.WriteWith(path, []byte(data), 0o600, restrict)
 }
 
 // restrict limits a file to the service account. Mode 0600 does that on
@@ -170,6 +160,11 @@ func (s *Source) Key() (*Key, error) {
 	}
 	k, err := Load(s.Path)
 	if err != nil {
+		if s.key != nil {
+			// A file caught mid-replace or damaged: keep signing with the key
+			// that works rather than stop.
+			return s.key, nil
+		}
 		return nil, err
 	}
 	s.key, s.mod, s.sz = k, fi.ModTime(), fi.Size()
