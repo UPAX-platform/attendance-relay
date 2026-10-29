@@ -175,3 +175,22 @@ func TestEmptyChunkFloodEnds(t *testing.T) {
 		t.Fatal("no error")
 	}
 }
+
+func TestRecordSize(t *testing.T) {
+	for _, c := range []struct {
+		tableLen, before, after, want int
+		ok                            bool
+	}{
+		{400, 10, 10, 40, true},
+		{200, 4, 5, 40, true},   // punches during every download: 5 records of 40, not 4 of 50
+		{48, 1, 3, 16, true},    // 3 records of 16
+		{80, 2, 5, 0, false},    // 2 of 40 or 5 of 16: can't tell
+		{200, 4, 4, 50, true},   // steady counter: as before
+		{120, 10, 12, 0, false}, // nothing fits
+	} {
+		got, ok := recordSize(c.tableLen, c.before, c.after)
+		if got != c.want || ok != c.ok {
+			t.Errorf("recordSize(%d, %d, %d) = %d, %v; want %d, %v", c.tableLen, c.before, c.after, got, ok, c.want, c.ok)
+		}
+	}
+}

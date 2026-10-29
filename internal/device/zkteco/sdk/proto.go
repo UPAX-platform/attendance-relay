@@ -65,6 +65,7 @@ const (
 	userRecordSize28  = 28
 	userRecordSize72  = 72
 	userRecordSize120 = 120
+	maxUserIDLen      = 23 // the 24-byte user ID field, NUL-terminated
 )
 
 var le = binary.LittleEndian

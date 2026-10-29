@@ -526,17 +526,25 @@ func (c *Client) userRecordSize() (int, error) {
 	return userRecordSize72, nil
 }
 
+// putUserID stores pin in the record's user ID field. The 28-byte layout
+// holds a number; the 72- and 120-byte ones a 24-byte NUL-terminated
+// string, so at most maxUserIDLen bytes. A PIN that doesn't fit is an
+// error, never cut short: the cut PIN would name a different user.
 func putUserID(rec []byte, pin string) error {
-	switch len(rec) {
-	case userRecordSize28:
+	if len(rec) == userRecordSize28 {
 		n, err := strconv.ParseUint(pin, 10, 32)
 		if err != nil {
-			return fmt.Errorf("zk: this device only takes numeric PINs, got %q", pin)
+			return fmt.Errorf("zk: this device only takes numeric PINs up to 4294967295, got %q", pin)
 		}
 		le.PutUint32(rec[24:], uint32(n))
-	case userRecordSize120:
+		return nil
+	}
+	if len(pin) > maxUserIDLen || strings.IndexByte(pin, 0) >= 0 {
+		return fmt.Errorf("zk: a PIN on this device is at most %d bytes, got %q", maxUserIDLen, pin)
+	}
+	if len(rec) == userRecordSize120 {
 		putString(rec[96:120], pin)
-	default:
+	} else {
 		putString(rec[48:72], pin)
 	}
 	return nil
@@ -572,7 +580,9 @@ func (c *Client) Attendance() ([]Record, error) {
 // attendance also returns the record size. The size is the table length
 // divided by the record counter, so a punch landing between the two reads
 // would skew it: the counter is read again afterwards and the download
-// retried until both reads agree.
+// retried until both reads agree. If it never settles, the size must still
+// be certain (see recordSize), or the download fails rather than decode
+// records at the wrong stride.
 func (c *Client) attendance() ([]Record, int, error) {
 	for attempt := 0; ; attempt++ {
 		before, err := c.Sizes()
@@ -596,10 +606,36 @@ func (c *Client) attendance() ([]Record, int, error) {
 		if len(data) < 4 {
 			return nil, 0, nil
 		}
-		recSize := int(le.Uint32(data)) / before.Records
+		recSize, ok := recordSize(int(le.Uint32(data)), before.Records, after.Records)
+		if !ok {
+			return nil, 0, fmt.Errorf("zk: the attendance log kept changing during download (%d, then %d records)", before.Records, after.Records)
+		}
 		recs, err := c.decodeAttendance(data[4:], recSize, before.Users)
 		return recs, recSize, err
 	}
+}
+
+// recordSize works out the attendance record size from the table length.
+// With a steady counter it is the length divided by the count. When the
+// counter moved during the download, the table holds some count between
+// the two readings: the size is used only if exactly one known record size
+// fits a count in that range.
+func recordSize(tableLen, before, after int) (int, bool) {
+	if before == after {
+		return tableLen / before, true
+	}
+	lo, hi := min(before, after), max(before, after)
+	size := 0
+	for _, s := range []int{attRecordSize40, attRecordSize16, attRecordSize8} {
+		if tableLen%s != 0 || tableLen/s < lo || tableLen/s > hi {
+			continue
+		}
+		if size != 0 {
+			return 0, false // ambiguous
+		}
+		size = s
+	}
+	return size, size != 0
 }
 
 func (c *Client) decodeAttendance(data []byte, recSize, userCount int) ([]Record, error) {

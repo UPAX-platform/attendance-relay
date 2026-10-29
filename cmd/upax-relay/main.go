@@ -168,45 +168,69 @@ func installedBinary() string {
 // ensureInstalledBinary copies the running binary to installedBinary unless
 // it is already running from there.
 func ensureInstalledBinary() (string, error) {
-	target := installedBinary()
+	target, staged, err := stageBinary()
+	if err != nil || staged == "" {
+		return target, err
+	}
+	return target, placeBinary(target, staged)
+}
+
+// stageBinary copies the running binary next to installedBinary, ready to
+// be moved into place; staged is "" when the relay already runs from there.
+// Nothing installed is touched.
+func stageBinary() (target, staged string, err error) {
+	target = installedBinary()
 	self, err := os.Executable()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if self, err = filepath.EvalSymlinks(self); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if t, err := filepath.EvalSymlinks(target); err == nil && (t == self || runtime.GOOS == "windows" && strings.EqualFold(t, self)) {
-		return target, nil
+		return target, "", nil
 	}
 	src, err := os.Open(self)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer src.Close()
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return "", wrapPerm(err)
+		return "", "", wrapPerm(err)
 	}
 	tmp := target + ".new"
 	dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 	if err != nil {
-		return "", wrapPerm(err)
+		return "", "", wrapPerm(err)
 	}
 	if _, err := io.Copy(dst, src); err != nil {
 		dst.Close()
 		os.Remove(tmp)
-		return "", err
+		return "", "", err
 	}
 	if err := dst.Close(); err != nil {
 		os.Remove(tmp)
-		return "", err
+		return "", "", err
 	}
-	if err := os.Rename(tmp, target); err != nil {
-		os.Remove(tmp)
-		return "", wrapPerm(err)
+	return target, tmp, nil
+}
+
+// placeBinary moves a staged binary over target. On Windows the old exe
+// can stay locked for a moment after its service stops, so it retries.
+func placeBinary(target, staged string) error {
+	var err error
+	for range 10 {
+		if err = os.Rename(staged, target); err == nil || runtime.GOOS != "windows" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err != nil {
+		os.Remove(staged)
+		return wrapPerm(err)
 	}
 	fmt.Printf("Installed %s\n", target)
-	return target, nil
+	return nil
 }
 
 // newService describes the service. exe is the binary it runs; "" leaves it
@@ -281,18 +305,33 @@ func cmdService(action string, args []string) error {
 }
 
 // installAndStart (re)installs the service pointing at cfgPath and starts it.
+// The new binary is in place before the old service is removed, so a
+// failed copy leaves the old service as it was.
 func installAndStart(cfgPath string) error {
+	exe, staged, err := stageBinary()
+	if err != nil {
+		return err
+	}
 	old, _, err := newService(cfgPath, "")
 	if err != nil {
+		os.Remove(staged)
 		return err
 	}
-	if st, err := old.Status(); err == nil && st != service.StatusUnknown {
+	st, err := old.Status()
+	installed := err == nil && st != service.StatusUnknown
+	if installed {
 		_ = old.Stop()
-		_ = old.Uninstall()
 	}
-	exe, err := ensureInstalledBinary()
-	if err != nil {
-		return err
+	if staged != "" {
+		if err := placeBinary(exe, staged); err != nil {
+			if installed && st == service.StatusRunning {
+				_ = old.Start()
+			}
+			return fmt.Errorf("could not replace %s; the service was left as it was: %w", exe, err)
+		}
+	}
+	if installed {
+		_ = old.Uninstall()
 	}
 	s, _, err := newService(cfgPath, exe)
 	if err != nil {

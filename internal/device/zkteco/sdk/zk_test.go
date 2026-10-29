@@ -215,3 +215,50 @@ func TestSetCommKey(t *testing.T) {
 	}
 	c2.Close()
 }
+
+// A punch during every download leaves the counter unsettled after all
+// retries; the records must still decode at the right size.
+func TestAttendanceWhilePunching(t *testing.T) {
+	d := zksim.New("BUSY")
+	t0 := time.Date(2026, 10, 28, 8, 0, 0, 0, time.UTC)
+	d.Punch("1", t0, 1, 0)
+	n := 1
+	d.BeforeAttLogRead = func() {
+		n++
+		d.Punch(fmt.Sprint(n), t0.Add(time.Duration(n)*time.Minute), 1, 0)
+	}
+	c := dial(t, d, 0)
+	recs, err := c.Attendance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range recs {
+		if r.UserID != fmt.Sprint(i+1) || r.Time.Year() != 2026 {
+			t.Fatalf("record %d decoded as %+v", i, r)
+		}
+	}
+	if len(recs) < 2 {
+		t.Fatalf("got %d records", len(recs))
+	}
+}
+
+func TestSetUserLongPIN(t *testing.T) {
+	d := zksim.New("PINS")
+	c := dial(t, d, 0)
+	longest := "12345678901234567890123" // 23 bytes: what the 24-byte field holds
+	for range 2 {
+		if err := c.SetUser(longest, "Long", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if users, _ := c.Users(); len(users) != 1 || users[0].UserID != longest {
+		t.Fatalf("users = %+v", users)
+	}
+	// One byte more must fail, not be cut down to another user's PIN.
+	if err := c.SetUser(longest+"4", "Too long", 0); err == nil {
+		t.Fatal("24-byte PIN accepted")
+	}
+	if users, _ := c.Users(); len(users) != 1 {
+		t.Fatalf("users = %+v", users)
+	}
+}
