@@ -3,17 +3,20 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/UPAX-platform/zk-relay/internal/zk"
+	"github.com/UPAX-platform/attendance-relay/internal/device"
 )
 
 type found struct {
-	addr, serial string
+	addr, vendor, serial string
+	port                 int
 }
 
 func cmdScan(args []string) error {
@@ -22,12 +25,12 @@ func cmdScan(args []string) error {
 	_ = fs.Parse(args)
 	res := scanNetwork(context.Background(), *subnet, true)
 	if len(res) == 0 {
-		fmt.Println("no devices found")
+		fmt.Println("no terminals found")
 		return nil
 	}
 	fmt.Println()
 	for _, f := range res {
-		fmt.Printf("%-21s %s\n", f.addr, f.serial)
+		fmt.Printf("%-21s %-8s %s\n", net.JoinHostPort(f.addr, strconv.Itoa(f.port)), f.vendor, f.serial)
 	}
 	return nil
 }
@@ -88,7 +91,7 @@ func scanNetwork(ctx context.Context, cidr string, verbose bool) []found {
 	var ips []net.IP
 	for _, n := range nets {
 		if verbose {
-			fmt.Printf("scanning %s for ZKTeco devices (port 4370) ...\n", n)
+			fmt.Printf("scanning %s for terminals ...\n", n)
 		}
 		ips = append(ips, hosts(n)...)
 	}
@@ -99,36 +102,42 @@ func scanNetwork(ctx context.Context, cidr string, verbose bool) []found {
 		wg  sync.WaitGroup
 		sem = make(chan struct{}, 128)
 	)
-	for _, ip := range ips {
-		addr := net.JoinHostPort(ip.String(), "4370")
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-			if err != nil {
-				return
-			}
-			conn.Close()
-			f := found{addr: ip.String(), serial: "(port open)"}
-			if c, err := zk.Dial(ctx, addr, 0, 3*time.Second); err == nil {
-				if sn, err := c.SerialNumber(); err == nil {
-					f.serial = "serial " + sn
+	for _, vendor := range device.Vendors() {
+		drv, _ := device.Lookup(vendor)
+		port := drv.DefaultPort()
+		for _, ip := range ips {
+			addr := net.JoinHostPort(ip.String(), strconv.Itoa(port))
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+				if err != nil {
+					return
 				}
-				c.Close()
-			} else if err == zk.ErrUnauthorized {
-				f.serial = "(ZKTeco, comm key set)"
-			}
-			mu.Lock()
-			res = append(res, f)
-			mu.Unlock()
-		}()
+				conn.Close()
+				f := found{addr: ip.String(), port: port, vendor: vendor, serial: "(port open)"}
+				c, err := drv.Dial(ctx, device.Target{Host: ip.String(), Port: port}, 3*time.Second)
+				switch {
+				case err == nil:
+					if in, err := c.Info(); err == nil {
+						f.serial = "serial " + in.Serial
+					}
+					c.Close()
+				case errors.Is(err, device.ErrUnauthorized):
+					f.serial = "(comm key set)"
+				}
+				mu.Lock()
+				res = append(res, f)
+				mu.Unlock()
+			}()
+		}
 	}
 	wg.Wait()
 	sort.Slice(res, func(i, j int) bool { return res[i].addr < res[j].addr })
 	if verbose {
-		fmt.Printf("found %d device(s)\n", len(res))
+		fmt.Printf("found %d terminal(s)\n", len(res))
 	}
 	return res
 }

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/UPAX-platform/zk-relay/internal/zk/zksim"
+	"github.com/UPAX-platform/attendance-relay/internal/device/zkteco/zksim"
 )
 
 func main() {

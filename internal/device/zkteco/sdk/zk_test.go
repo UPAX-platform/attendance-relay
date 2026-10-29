@@ -1,4 +1,4 @@
-package zk_test
+package sdk_test
 
 import (
 	"context"
@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/UPAX-platform/zk-relay/internal/zk"
-	"github.com/UPAX-platform/zk-relay/internal/zk/zksim"
+	"github.com/UPAX-platform/attendance-relay/internal/device/zkteco/sdk"
+	"github.com/UPAX-platform/attendance-relay/internal/device/zkteco/zksim"
 )
 
 func TestChecksumMatchesPyzk(t *testing.T) {
@@ -16,11 +16,11 @@ func TestChecksumMatchesPyzk(t *testing.T) {
 	// pyzk's __create_checksum loop: words 1000 + 0 + 0 + 65534 = 66534,
 	// wrapped -65535 = 999, ~999 = -1000, +65535 = 64535.
 	pkt := []byte{0xe8, 0x03, 0, 0, 0, 0, 0xfe, 0xff}
-	if got := zk.Checksum(pkt); got != 64535 {
+	if got := sdk.Checksum(pkt); got != 64535 {
 		t.Fatalf("checksum = %d, want 64535", got)
 	}
 	// first packet uses reply id 0 after pyzk's increment/wrap
-	enc, used := zk.EncodePacket(zk.CmdConnect, 0, 65534, nil)
+	enc, used := sdk.EncodePacket(sdk.CmdConnect, 0, 65534, nil)
 	if used != 0 {
 		t.Fatalf("reply id = %d, want 0", used)
 	}
@@ -34,28 +34,28 @@ func TestChecksumMatchesPyzk(t *testing.T) {
 // talking to a real K14 Pro. zksim shares the constants, so only a fixed
 // expectation like this one catches a wrong magic.
 func TestFrameMatchesPyzk(t *testing.T) {
-	enc, _ := zk.EncodePacket(zk.CmdConnect, 0, 65534, nil)
+	enc, _ := sdk.EncodePacket(sdk.CmdConnect, 0, 65534, nil)
 	want := []byte{0x50, 0x50, 0x82, 0x7d, 0x08, 0, 0, 0, 0xe8, 0x03, 0x17, 0xfc, 0, 0, 0, 0}
-	if got := zk.Frame(enc); string(got) != string(want) {
+	if got := sdk.Frame(enc); string(got) != string(want) {
 		t.Fatalf("frame % x, want % x", got, want)
 	}
 }
 
 func TestTimeRoundTrip(t *testing.T) {
 	in := time.Date(2026, 10, 28, 17, 4, 59, 0, time.UTC)
-	if got := zk.DecodeTime(zk.EncodeTime(in)); !got.Equal(in) {
+	if got := sdk.DecodeTime(sdk.EncodeTime(in)); !got.Equal(in) {
 		t.Fatalf("round trip %v -> %v", in, got)
 	}
 }
 
-func dial(t *testing.T, d *zksim.Device, pw uint32) *zk.Client {
+func dial(t *testing.T, d *zksim.Device, pw uint32) *sdk.Client {
 	t.Helper()
 	addr, err := d.Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Close() })
-	c, err := zk.Dial(context.Background(), addr, pw, 2*time.Second)
+	c, err := sdk.Dial(context.Background(), addr, pw, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,8 +105,8 @@ func TestPassword(t *testing.T) {
 	}
 
 	addr, _ := d.Listen("127.0.0.1:0")
-	_, err := zk.Dial(context.Background(), addr, 1, time.Second)
-	if !errors.Is(err, zk.ErrUnauthorized) {
+	_, err := sdk.Dial(context.Background(), addr, 1, time.Second)
+	if !errors.Is(err, sdk.ErrUnauthorized) {
 		t.Fatalf("wrong password: err = %v", err)
 	}
 }
@@ -175,4 +175,43 @@ func TestSetUserOnEmptyDevice(t *testing.T) {
 	if name, _, ok := d.User("1"); !ok || name != "First" {
 		t.Fatalf("user = %q %v", name, ok)
 	}
+}
+
+func TestSetTime(t *testing.T) {
+	d := zksim.New("SIM1")
+	c := dial(t, d, 0)
+	want := time.Date(2026, 10, 28, 9, 30, 0, 0, time.UTC)
+	if err := c.SetTime(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Time()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skew := got.Sub(want); skew < 0 || skew > 2*time.Second {
+		t.Fatalf("device time %v, want about %v", got, want)
+	}
+}
+
+func TestSetCommKey(t *testing.T) {
+	d := zksim.New("SIM1")
+	c := dial(t, d, 0)
+	if err := c.SetCommKey(0); err == nil {
+		t.Fatal("comm key 0 accepted")
+	}
+	if err := c.SetCommKey(424242); err != nil {
+		t.Fatal(err)
+	}
+	// This session stays authenticated; new ones need the key.
+	if _, err := c.Sizes(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sdk.Dial(context.Background(), c.Addr, 0, 2*time.Second); !errors.Is(err, sdk.ErrUnauthorized) {
+		t.Fatalf("dial without the new key: %v, want ErrUnauthorized", err)
+	}
+	c2, err := sdk.Dial(context.Background(), c.Addr, 424242, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2.Close()
 }

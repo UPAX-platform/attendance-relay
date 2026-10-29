@@ -1,4 +1,4 @@
-package zk
+package sdk
 
 import (
 	"bufio"
@@ -193,6 +193,53 @@ func (c *Client) Time() (time.Time, error) {
 		return time.Time{}, fmt.Errorf("zk: can't read time")
 	}
 	return DecodeTime(le.Uint32(p.Data)), nil
+}
+
+// SetTime sets the device clock to t's wall-clock reading (the device has
+// no zone: pass t already in the zone the device should show).
+func (c *Client) SetTime(t time.Time) error {
+	b := make([]byte, 4)
+	le.PutUint32(b, EncodeTime(t))
+	p, err := c.command(CmdSetTime, b)
+	if err != nil {
+		return err
+	}
+	if !ok(p) {
+		return fmt.Errorf("zk: device refused to set the time (response %d)", p.Cmd)
+	}
+	return c.refresh()
+}
+
+// DeviceName returns the model name, e.g. "K14 Pro". Older firmware may not
+// report it.
+func (c *Client) DeviceName() (string, error) { return c.Option("~DeviceName") }
+
+// SetOption writes a configuration parameter ("name=value") and applies it.
+func (c *Client) SetOption(name, value string) error {
+	p, err := c.command(CmdOptionsWRQ, append([]byte(name+"="+value), 0))
+	if err != nil {
+		return err
+	}
+	if !ok(p) {
+		return fmt.Errorf("zk: device refused option %s (response %d)", name, p.Cmd)
+	}
+	p, err = c.command(CmdRefreshOption, nil)
+	if err != nil {
+		return err
+	}
+	if !ok(p) {
+		return fmt.Errorf("zk: device refused to apply option %s (response %d)", name, p.Cmd)
+	}
+	return nil
+}
+
+// SetCommKey sets the device's communication password (1-999999). It takes
+// effect for new connections; this one stays authenticated.
+func (c *Client) SetCommKey(key uint32) error {
+	if key == 0 || key > 999999 {
+		return fmt.Errorf("zk: comm key %d out of range 1-999999", key)
+	}
+	return c.SetOption("COMKey", strconv.FormatUint(uint64(key), 10))
 }
 
 // Restart reboots the device. The connection is unusable afterwards.

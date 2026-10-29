@@ -7,10 +7,12 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/UPAX-platform/zk-relay/internal/zk"
+	"github.com/UPAX-platform/attendance-relay/internal/device/zkteco/sdk"
 )
 
 var le = binary.LittleEndian
@@ -36,6 +38,8 @@ type Device struct {
 	BeforeAttLogRead func()
 
 	mu       sync.Mutex
+	options  map[string]string // written with CMD_OPTIONS_WRQ, applied on refresh
+	clock    time.Duration     // device clock minus the real time
 	punches  []punch
 	users    map[string]*simUser
 	restarts int
@@ -143,7 +147,7 @@ func (d *Device) Close() error {
 func (d *Device) serve(conn net.Conn) {
 	defer conn.Close()
 	const session = 0x3a2b
-	authed := d.Password == 0
+	authed := d.CommKey() == 0
 	var pending []byte // data prepared by CMD_PREPARE_BUFFER
 
 	write := func(cmd uint16, reply uint16, data []byte) error {
@@ -152,8 +156,8 @@ func (d *Device) serve(conn net.Conn) {
 		le.PutUint16(buf[4:], session)
 		le.PutUint16(buf[6:], reply)
 		copy(buf[8:], data)
-		le.PutUint16(buf[2:], zk.Checksum(buf))
-		_, err := conn.Write(zk.Frame(buf))
+		le.PutUint16(buf[2:], sdk.Checksum(buf))
+		_, err := conn.Write(sdk.Frame(buf))
 		return err
 	}
 
@@ -166,48 +170,76 @@ func (d *Device) serve(conn net.Conn) {
 		if _, err := io.ReadFull(conn, body); err != nil {
 			return
 		}
-		p, err := zk.DecodePacket(body)
+		p, err := sdk.DecodePacket(body)
 		if err != nil {
 			return
 		}
 		r := p.Reply
 
-		if !authed && p.Cmd != zk.CmdConnect && p.Cmd != zk.CmdAuth {
-			_ = write(zk.CmdAckUnauth, r, nil)
+		if !authed && p.Cmd != sdk.CmdConnect && p.Cmd != sdk.CmdAuth {
+			_ = write(sdk.CmdAckUnauth, r, nil)
 			continue
 		}
 
 		switch p.Cmd {
-		case zk.CmdConnect:
+		case sdk.CmdConnect:
 			if authed {
-				err = write(zk.CmdAckOK, r, nil)
+				err = write(sdk.CmdAckOK, r, nil)
 			} else {
-				err = write(zk.CmdAckUnauth, r, nil)
+				err = write(sdk.CmdAckUnauth, r, nil)
 			}
-		case zk.CmdAuth:
-			if string(p.Data) == string(zk.CommKey(d.Password, session)) {
+		case sdk.CmdAuth:
+			if string(p.Data) == string(sdk.CommKey(d.CommKey(), session)) {
 				authed = true
-				err = write(zk.CmdAckOK, r, nil)
+				err = write(sdk.CmdAckOK, r, nil)
 			} else {
-				err = write(zk.CmdAckUnauth, r, nil)
+				err = write(sdk.CmdAckUnauth, r, nil)
 			}
-		case zk.CmdExit:
-			_ = write(zk.CmdAckOK, r, nil)
+		case sdk.CmdExit:
+			_ = write(sdk.CmdAckOK, r, nil)
 			return
-		case zk.CmdGetVersion:
-			err = write(zk.CmdAckOK, r, append([]byte(d.Firmware), 0))
-		case zk.CmdOptionsRRQ:
+		case sdk.CmdGetVersion:
+			err = write(sdk.CmdAckOK, r, append([]byte(d.Firmware), 0))
+		case sdk.CmdOptionsRRQ:
 			name := string(p.Data)
 			if i := len(name) - 1; i >= 0 && name[i] == 0 {
 				name = name[:i]
 			}
 			val := map[string]string{"~SerialNumber": d.Serial, "~Platform": "ZMM220_TFT", "~DeviceName": "K14 Pro (sim)"}[name]
-			err = write(zk.CmdAckOK, r, append([]byte(name+"="+val), 0))
-		case zk.CmdGetTime:
+			err = write(sdk.CmdAckOK, r, append([]byte(name+"="+val), 0))
+		case sdk.CmdGetTime:
 			b := make([]byte, 4)
-			le.PutUint32(b, zk.EncodeTime(time.Now()))
-			err = write(zk.CmdAckOK, r, b)
-		case zk.CmdGetFreeSizes:
+			le.PutUint32(b, sdk.EncodeTime(d.Clock()))
+			err = write(sdk.CmdAckOK, r, b)
+		case sdk.CmdSetTime:
+			if len(p.Data) < 4 {
+				err = write(sdk.CmdAckError, r, nil)
+				break
+			}
+			d.SetClock(sdk.DecodeTime(le.Uint32(p.Data)))
+			err = write(sdk.CmdAckOK, r, nil)
+		case sdk.CmdOptionsWRQ:
+			k, v, found := strings.Cut(cstr(p.Data), "=")
+			if !found {
+				err = write(sdk.CmdAckError, r, nil)
+				break
+			}
+			d.mu.Lock()
+			if d.options == nil {
+				d.options = map[string]string{}
+			}
+			d.options[k] = v
+			d.mu.Unlock()
+			err = write(sdk.CmdAckOK, r, nil)
+		case sdk.CmdRefreshOption:
+			d.mu.Lock()
+			if v, found := d.options["COMKey"]; found {
+				n, _ := strconv.ParseUint(v, 10, 32)
+				d.Password = uint32(n)
+			}
+			d.mu.Unlock()
+			err = write(sdk.CmdAckOK, r, nil)
+		case sdk.CmdGetFreeSizes:
 			d.mu.Lock()
 			b := make([]byte, 92)
 			le.PutUint32(b[4*4:], uint32(len(d.users)))
@@ -215,37 +247,37 @@ func (d *Device) serve(conn net.Conn) {
 			le.PutUint32(b[15*4:], 3000)
 			le.PutUint32(b[16*4:], 100000)
 			d.mu.Unlock()
-			err = write(zk.CmdAckOK, r, b)
-		case zk.CmdPrepareBuffer:
+			err = write(sdk.CmdAckOK, r, b)
+		case sdk.CmdPrepareBuffer:
 			if len(p.Data) < 11 {
-				err = write(zk.CmdAckError, r, nil)
+				err = write(sdk.CmdAckError, r, nil)
 				break
 			}
 			switch le.Uint16(p.Data[1:]) {
-			case zk.CmdAttLogRRQ:
+			case sdk.CmdAttLogRRQ:
 				if d.BeforeAttLogRead != nil {
 					d.BeforeAttLogRead()
 				}
 				pending = d.attData()
-			case zk.CmdUserTempRRQ:
+			case sdk.CmdUserTempRRQ:
 				pending = d.userData()
 			default:
-				err = write(zk.CmdAckError, r, nil)
+				err = write(sdk.CmdAckError, r, nil)
 				continue
 			}
 			b := make([]byte, 9)
 			le.PutUint32(b[1:], uint32(len(pending)))
-			err = write(zk.CmdAckOK, r, b)
-		case zk.CmdReadBuffer:
+			err = write(sdk.CmdAckOK, r, b)
+		case sdk.CmdReadBuffer:
 			start, size := int(le.Uint32(p.Data)), int(le.Uint32(p.Data[4:]))
 			if start+size > len(pending) {
-				err = write(zk.CmdAckError, r, nil)
+				err = write(sdk.CmdAckError, r, nil)
 				break
 			}
 			chunk := pending[start : start+size]
 			sz := make([]byte, 8)
 			le.PutUint32(sz, uint32(size))
-			if err = write(zk.CmdPrepareData, r, sz); err != nil {
+			if err = write(sdk.CmdPrepareData, r, sz); err != nil {
 				break
 			}
 			step := d.ChunkSize
@@ -254,44 +286,77 @@ func (d *Device) serve(conn net.Conn) {
 			}
 			for len(chunk) > 0 && err == nil {
 				n := min(step, len(chunk))
-				err = write(zk.CmdData, r, chunk[:n])
+				err = write(sdk.CmdData, r, chunk[:n])
 				chunk = chunk[n:]
 			}
 			if err == nil {
-				err = write(zk.CmdAckOK, r, nil)
+				err = write(sdk.CmdAckOK, r, nil)
 			}
-		case zk.CmdFreeData:
+		case sdk.CmdFreeData:
 			pending = nil
-			err = write(zk.CmdAckOK, r, nil)
-		case zk.CmdUserWRQ:
+			err = write(sdk.CmdAckOK, r, nil)
+		case sdk.CmdUserWRQ:
 			if len(p.Data) != 72 {
-				err = write(zk.CmdAckError, r, nil)
+				err = write(sdk.CmdAckError, r, nil)
 				break
 			}
 			d.writeUser(p.Data)
-			err = write(zk.CmdAckOK, r, nil)
-		case zk.CmdDeleteUser:
+			err = write(sdk.CmdAckOK, r, nil)
+		case sdk.CmdDeleteUser:
 			if len(p.Data) < 2 {
-				err = write(zk.CmdAckError, r, nil)
+				err = write(sdk.CmdAckError, r, nil)
 				break
 			}
 			d.deleteUser(int(le.Uint16(p.Data)))
-			err = write(zk.CmdAckOK, r, nil)
-		case zk.CmdRestart:
+			err = write(sdk.CmdAckOK, r, nil)
+		case sdk.CmdRestart:
 			d.mu.Lock()
 			d.restarts++
 			d.mu.Unlock()
-			_ = write(zk.CmdAckOK, r, nil)
+			_ = write(sdk.CmdAckOK, r, nil)
 			return
-		case zk.CmdEnableDevice, zk.CmdDisableDevice, zk.CmdRegEvent, zk.CmdRefreshData, 60, 62:
-			err = write(zk.CmdAckOK, r, nil)
+		case sdk.CmdEnableDevice, sdk.CmdDisableDevice, sdk.CmdRegEvent, sdk.CmdRefreshData, 60, 62:
+			err = write(sdk.CmdAckOK, r, nil)
 		default:
-			err = write(zk.CmdAckUnknown, r, nil)
+			err = write(sdk.CmdAckUnknown, r, nil)
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+// Clock is the device's clock (wall time in the device's own zone, carried
+// as UTC like sdk.DecodeTime's values).
+func (d *Device) Clock() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return wall(time.Now()).Add(d.clock).Truncate(time.Second)
+}
+
+// SetClock sets the device clock to the wall time t.
+func (d *Device) SetClock(t time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.clock = wall(t).Sub(wall(time.Now()))
+}
+
+// CommKey is the comm key new connections must present.
+func (d *Device) CommKey() uint32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Password
+}
+
+// SetCommKey changes the comm key, as if done in the device menu.
+func (d *Device) SetCommKey(k uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.Password = k
+}
+
+func wall(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
 }
 
 func (d *Device) attData() []byte {
@@ -304,7 +369,7 @@ func (d *Device) attData() []byte {
 		le.PutUint16(rec, uint16(p.uid))
 		copy(rec[2:26], p.userID)
 		rec[26] = byte(p.verify)
-		le.PutUint32(rec[27:], zk.EncodeTime(p.t))
+		le.PutUint32(rec[27:], sdk.EncodeTime(p.t))
 		rec[31] = byte(p.state)
 		out = append(out, rec...)
 	}

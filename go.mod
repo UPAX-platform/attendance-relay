@@ -1,4 +1,4 @@
-module github.com/UPAX-platform/zk-relay
+module github.com/UPAX-platform/attendance-relay
 
 go 1.26.4
 

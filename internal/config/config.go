@@ -1,65 +1,106 @@
-// Package config loads and saves the relay configuration file.
+// Package config loads and saves the relay configuration file (version 2).
+//
+// The file holds no UPAX secret: the relay authenticates with its key
+// (relay.key, next to the config). It does hold terminal comm keys, so it
+// stays readable by administrators only.
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/UPAX-platform/attendance-relay/internal/device"
+	"github.com/UPAX-platform/attendance-relay/internal/upax"
 )
 
-// Device is one ZKTeco terminal on the local network.
-type Device struct {
-	Name     string `yaml:"name,omitempty"`
+// Version is the config format this relay reads.
+const Version = 2
+
+// Terminal is one terminal the relay pulls over the LAN.
+type Terminal struct {
+	Name string `yaml:"name,omitempty"`
+	// Vendor selects the driver; default zkteco.
+	Vendor   string `yaml:"vendor,omitempty"`
 	Host     string `yaml:"host"`
-	Port     int    `yaml:"port,omitempty"`     // default 4370
-	Password uint32 `yaml:"password,omitempty"` // device comm key, 0 = none
-	// UpaxURL overrides the top-level upax_url for this device. Each
-	// physical device should have its own UPAX device address.
-	UpaxURL string `yaml:"upax_url,omitempty"`
-	// Serial overrides the serial number read from the device.
-	Serial string `yaml:"serial,omitempty"`
+	Port     int    `yaml:"port,omitempty"`     // default: the vendor's SDK port
+	Password uint32 `yaml:"password,omitempty"` // terminal comm key, 0 = none
+	// ManageCommKey overrides manage_comm_keys for this terminal.
+	ManageCommKey *bool `yaml:"manage_comm_key,omitempty"`
 }
 
-// Addr returns host:port.
-func (d Device) Addr() string {
-	p := d.Port
-	if p == 0 {
-		p = 4370
+// VendorName is the terminal's vendor with the default filled in.
+func (t Terminal) VendorName() string {
+	if t.Vendor == "" {
+		return device.DefaultVendor
 	}
-	return net.JoinHostPort(d.Host, strconv.Itoa(p))
+	return t.Vendor
+}
+
+// Target is where to dial the terminal.
+func (t Terminal) Target() device.Target {
+	return device.Target{Host: t.Host, Port: t.Port, Password: t.Password}
+}
+
+// Addr returns host:port with the vendor's default port filled in.
+func (t Terminal) Addr() string {
+	port := 0
+	if d, err := device.Lookup(t.Vendor); err == nil {
+		port = d.DefaultPort()
+	}
+	return t.Target().Addr(port)
 }
 
 // Label is a human-friendly name for logs.
-func (d Device) Label() string {
-	if d.Name != "" {
-		return d.Name
+func (t Terminal) Label() string {
+	if t.Name != "" {
+		return t.Name
 	}
-	return d.Addr()
+	return t.Addr()
 }
+
+// Listener is the LAN server push-capable terminals send to.
+type Listener struct {
+	Enabled bool   `yaml:"enabled"`
+	Bind    string `yaml:"bind,omitempty"`
+}
+
+// DefaultListenerBind is where the listener listens unless told otherwise.
+const DefaultListenerBind = "0.0.0.0:8081"
 
 // Config is the whole file.
 type Config struct {
-	UpaxURL string   `yaml:"upax_url,omitempty"`
-	Devices []Device `yaml:"devices"`
-	// Backfill controls what happens the first time a device is seen:
-	// "all" uploads the device's stored history, "none" only new punches,
-	// "since:YYYY-MM-DD" only stored punches on/after that date.
+	Version int `yaml:"version"`
+	// UPAX is the organisation's public plane origin: no path, no token.
+	UPAX string `yaml:"upax"`
+	// RelayID is written by pairing. Public, not a secret.
+	RelayID   string     `yaml:"relay_id,omitempty"`
+	Terminals []Terminal `yaml:"terminals"`
+	// ManageCommKeys sets and keeps a random comm key on every pulled
+	// terminal that has none (off by default).
+	ManageCommKeys bool     `yaml:"manage_comm_keys"`
+	Listener       Listener `yaml:"listener"`
+	// Backfill controls the first upload from a pulled terminal: "all"
+	// uploads its stored history, "none" only new punches,
+	// "since:YYYY-MM-DD" stored punches on/after that date.
 	Backfill string `yaml:"backfill,omitempty"`
-	// PollInterval is how often the device is checked for new punches.
+	// PollInterval is how often each terminal's record counter is checked.
 	PollInterval Duration `yaml:"poll_interval,omitempty"`
-	// DataDir holds state and logs; defaults to the config file's directory.
+	// DataDir holds the key, state, health files and logs; defaults to the
+	// config file's directory.
 	DataDir string `yaml:"data_dir,omitempty"`
 
 	path string
+	mu   sync.Mutex // serialises Save (the service writes managed comm keys)
 }
 
 // Duration is a time.Duration that reads/writes as "5s".
@@ -92,24 +133,30 @@ func DefaultPath() string {
 	}
 }
 
-// Load reads and validates the config at path.
+// Load reads and validates the config at path. Unknown keys are errors, so
+// a typo doesn't silently change behaviour.
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	c := &Config{}
-	if err := yaml.Unmarshal(b, c); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(c); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	c.path = path
 	c.applyDefaults()
-	return c, c.Validate()
+	if err := c.Validate(); err != nil {
+		return c, fmt.Errorf("%s: %w", path, err)
+	}
+	return c, nil
 }
 
 // New returns an empty config that will be saved at path.
 func New(path string) *Config {
-	c := &Config{path: path}
+	c := &Config{Version: Version, path: path}
 	c.applyDefaults()
 	return c
 }
@@ -121,9 +168,12 @@ func (c *Config) applyDefaults() {
 	if c.PollInterval <= 0 {
 		c.PollInterval = Duration(5 * time.Second)
 	}
+	if c.Listener.Bind == "" {
+		c.Listener.Bind = DefaultListenerBind
+	}
 }
 
-// StateDir is where state and logs are kept.
+// StateDir is where the key, state and logs are kept.
 func (c *Config) StateDir() string {
 	if c.DataDir != "" {
 		return c.DataDir
@@ -131,39 +181,54 @@ func (c *Config) StateDir() string {
 	return filepath.Dir(c.path)
 }
 
+// KeyPath is the relay's private key file.
+func (c *Config) KeyPath() string { return filepath.Join(c.StateDir(), "relay.key") }
+
 // Path is the file this config was loaded from.
 func (c *Config) Path() string { return c.path }
 
-// URLFor returns the UPAX device address to use for d.
-func (c *Config) URLFor(d Device) string {
-	if d.UpaxURL != "" {
-		return d.UpaxURL
+// ManagesCommKey reports whether the relay manages t's comm key.
+func (c *Config) ManagesCommKey(t Terminal) bool {
+	if t.ManageCommKey != nil {
+		return *t.ManageCommKey
 	}
-	return c.UpaxURL
+	return c.ManageCommKeys
 }
 
 // Validate checks the config for mistakes a user is likely to make.
 func (c *Config) Validate() error {
 	var errs []error
-	if len(c.Devices) == 0 {
-		errs = append(errs, errors.New("no devices configured"))
+	if c.Version != Version {
+		errs = append(errs, fmt.Errorf("version must be %d (this relay reads config version %d only); run \"upax-relay setup\" to write a new config", Version, Version))
+	}
+	if err := upax.ValidateBase(c.UPAX); err != nil {
+		errs = append(errs, fmt.Errorf("upax: %w", err))
+	}
+	if c.RelayID != "" {
+		if err := upax.ValidateRelayID(c.RelayID); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if err := ValidateBackfill(c.Backfill); err != nil {
 		errs = append(errs, err)
 	}
-	urls := map[string]string{}
-	for i, d := range c.Devices {
-		if d.Host == "" {
-			errs = append(errs, fmt.Errorf("devices[%d]: host is required", i))
+	if c.Listener.Enabled {
+		if _, _, err := net.SplitHostPort(c.Listener.Bind); err != nil {
+			errs = append(errs, fmt.Errorf("listener.bind %q: %w", c.Listener.Bind, err))
 		}
-		u := c.URLFor(d)
-		if err := ValidateURL(u); err != nil {
-			errs = append(errs, fmt.Errorf("devices[%d] (%s): %w", i, d.Label(), err))
+	}
+	seen := map[string]string{}
+	for i, t := range c.Terminals {
+		if t.Host == "" {
+			errs = append(errs, fmt.Errorf("terminals[%d]: host is required", i))
 		}
-		if prev, dup := urls[u]; dup {
-			errs = append(errs, fmt.Errorf("devices %s and %s share the same UPAX address; give each device its own upax_url", prev, d.Label()))
+		if _, err := device.Lookup(t.Vendor); err != nil {
+			errs = append(errs, fmt.Errorf("terminals[%d] (%s): %w", i, t.Label(), err))
 		}
-		urls[u] = d.Label()
+		if prev, dup := seen[t.Addr()]; dup {
+			errs = append(errs, fmt.Errorf("terminals %s and %s are the same address %s", prev, t.Label(), t.Addr()))
+		}
+		seen[t.Addr()] = t.Label()
 	}
 	return errors.Join(errs...)
 }
@@ -180,23 +245,34 @@ func ValidateBackfill(s string) error {
 	return nil
 }
 
-// ValidateURL checks a UPAX device address.
-func ValidateURL(s string) error {
-	if s == "" {
-		return errors.New("upax_url is required")
+// SetPassword records a terminal's new comm key and saves the file.
+func (c *Config) SetPassword(addr string, key uint32) error {
+	c.mu.Lock()
+	for i := range c.Terminals {
+		if c.Terminals[i].Addr() == addr {
+			c.Terminals[i].Password = key
+		}
 	}
-	u, err := url.Parse(s)
-	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
-		return fmt.Errorf("upax_url %q is not a valid http(s) URL", s)
-	}
-	if strings.Contains(u.Path, "/iclock") {
-		return fmt.Errorf("upax_url should be the device address from UPAX, without /iclock/...")
-	}
-	return nil
+	c.mu.Unlock()
+	return c.Save()
 }
 
-// Save writes the config file (creating its directory).
+// Password returns the configured comm key of the terminal at addr.
+func (c *Config) Password(addr string) uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.Terminals {
+		if t.Addr() == addr {
+			return t.Password
+		}
+	}
+	return 0
+}
+
+// Save writes the config file atomically (creating its directory).
 func (c *Config) Save() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
 		return err
 	}
@@ -204,6 +280,14 @@ func (c *Config) Save() error {
 	if err != nil {
 		return err
 	}
-	header := "# UPAX ZKTeco relay configuration. See README for all options.\n"
-	return os.WriteFile(c.path, append([]byte(header), b...), 0o600)
+	header := "# UPAX attendance relay configuration. See README for all options.\n"
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, append([]byte(header), b...), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, c.path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }

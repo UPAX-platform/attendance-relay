@@ -1,0 +1,62 @@
+[
+  {
+    "name": "sync",
+    "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "public_key": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+    "fingerprint": "AS3NN9TMCD3MR0M5VXEVYAYAPW",
+    "method": "POST",
+    "url": "https://acme.upax.io/rly/01q2a0000000000000000000ab/sync",
+    "body": "{\"version\":\"2.0.0\",\"host_name\":\"frontdesk-pc\",\"uptime_s\":60,\"terminals\":[]}",
+    "created": 1793216924,
+    "nonce": "paWlpaWlpaWlpaWlpaWlpQ==",
+    "content_digest": "sha-256=:VqpJSv34gmIE9cvpw7Govxsgb57KSBVZIoDZYlT1nsQ=:",
+    "signature_base": "\"@method\": POST\n\"@authority\": acme.upax.io\n\"@path\": /rly/01q2a0000000000000000000ab/sync\n\"content-digest\": sha-256=:VqpJSv34gmIE9cvpw7Govxsgb57KSBVZIoDZYlT1nsQ=:\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"content-digest\");created=1793216924;nonce=\"paWlpaWlpaWlpaWlpaWlpQ==\";keyid=\"AS3NN9TMCD3MR0M5VXEVYAYAPW\";alg=\"ed25519\"",
+    "signature_input": "upax=(\"@method\" \"@authority\" \"@path\" \"content-digest\");created=1793216924;nonce=\"paWlpaWlpaWlpaWlpaWlpQ==\";keyid=\"AS3NN9TMCD3MR0M5VXEVYAYAPW\";alg=\"ed25519\"",
+    "signature": "upax=:nK4oMJvxIW3a4cUyoazc6KLgusXdKBZQbFVWr8MxPgI+xIGfTzjhQHcpFUWNHmyQxKisp2Q/uWvX/4vKBRbvAg==:"
+  },
+  {
+    "name": "pair, port in authority",
+    "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "public_key": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+    "fingerprint": "AS3NN9TMCD3MR0M5VXEVYAYAPW",
+    "method": "POST",
+    "url": "https://ACME.upax-sb.io:8443/rpair/RLY-7KQ2-M9XD-4TPA",
+    "body": "{\"public_key\":\"x\"}",
+    "created": 1793216924,
+    "nonce": "paWlpaWlpaWlpaWlpaWlpQ==",
+    "content_digest": "sha-256=:6NoLsnZqCnvNfxmFIOhRug3wz1n1UJ3lWPojcw2uu5E=:",
+    "signature_base": "\"@method\": POST\n\"@authority\": acme.upax-sb.io:8443\n\"@path\": /rpair/RLY-7KQ2-M9XD-4TPA\n\"content-digest\": sha-256=:6NoLsnZqCnvNfxmFIOhRug3wz1n1UJ3lWPojcw2uu5E=:\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"content-digest\");created=1793216924;nonce=\"paWlpaWlpaWlpaWlpaWlpQ==\";keyid=\"AS3NN9TMCD3MR0M5VXEVYAYAPW\";alg=\"ed25519\"",
+    "signature_input": "upax=(\"@method\" \"@authority\" \"@path\" \"content-digest\");created=1793216924;nonce=\"paWlpaWlpaWlpaWlpaWlpQ==\";keyid=\"AS3NN9TMCD3MR0M5VXEVYAYAPW\";alg=\"ed25519\"",
+    "signature": "upax=:jKU9Q2IetiLltWLO2tq/0oaOvfB9UPZRsHZAS2kPGurA9XMH1l55pXvPGLSG/nN4+vkpRZqNFSl4JrkI5wHlBw==:"
+  },
+  {
+    "name": "empty body, default port dropped",
+    "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "public_key": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+    "fingerprint": "AS3NN9TMCD3MR0M5VXEVYAYAPW",
+    "method": "POST",
+    "url": "https://acme.upax.io:443/rly/01q2a0000000000000000000ab/results",
+    "body": "",
+    "created": 1793216924,
+    "nonce": "paWlpaWlpaWlpaWlpaWlpQ==",
+    "content_digest": "sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:",
+    "signature_base": "\"@method\": POST\n\"@authority\": acme.upax.io\n\"@path\": /rly/01q2a0000000000000000000ab/results\n\"content-digest\": sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"content-digest\");created=1793216924;nonce=\"paWlpaWlpaWlpaWlpaWlpQ==\";keyid=\"AS3NN9TMCD3MR0M5VXEVYAYAPW\";alg=\"ed25519\"",
+    "signature_input": "upax=(\"@method\" \"@authority\" \"@path\" \"content-digest\");created=1793216924;nonce=\"paWlpaWlpaWlpaWlpaWlpQ==\";keyid=\"AS3NN9TMCD3MR0M5VXEVYAYAPW\";alg=\"ed25519\"",
+    "signature": "upax=:GJwwy0M9gnqtTSYYCKeugRW7jAHX8GYhF0MjiUS1F0Ehl82X/jbV9kpSuInmAISotWhbbHYLqVhmSksZoYOSCQ==:"
+  },
+  {
+    "name": "local development",
+    "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "public_key": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+    "fingerprint": "AS3NN9TMCD3MR0M5VXEVYAYAPW",
+    "method": "POST",
+    "url": "http://localhost:8300/rly/01q2a0000000000000000000ab/punches",
+    "body": "{\"serial\":\"SIM1\",\"punches\":[]}",
+    "created": 1793216924,
+    "nonce": "paWlpaWlpaWlpaWlpaWlpQ==",
+    "content_digest": "sha-256=:BmyA5hDk7b/uXyXdjdmRHOxU5eL2F+K+H4UJpVJ7qRE=:",
+    "signature_base": "\"@method\": POST\n\"@authority\": localhost:8300\n\"@path\": /rly/01q2a0000000000000000000ab/punches\n\"content-digest\": sha-256=:BmyA5hDk7b/uXyXdjdmRHOxU5eL2F+K+H4UJpVJ7qRE=:\n\"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"content-digest\");created=1793216924;nonce=\"paWlpaWlpaWlpaWlpaWlpQ==\";keyid=\"AS3NN9TMCD3MR0M5VXEVYAYAPW\";alg=\"ed25519\"",
+    "signature_input": "upax=(\"@method\" \"@authority\" \"@path\" \"content-digest\");created=1793216924;nonce=\"paWlpaWlpaWlpaWlpaWlpQ==\";keyid=\"AS3NN9TMCD3MR0M5VXEVYAYAPW\";alg=\"ed25519\"",
+    "signature": "upax=:uEAMhJrILUvH5un0dmpfc1D9StxgdcSfQVxJarsuG7YhwqV6uExe8qj488X8Fc5vQNcqGAMLlohu9raTNl8/Bw==:"
+  }
+]

@@ -1,11 +1,11 @@
-// Package zk implements the client side of the ZKTeco "standalone SDK"
+// Package sdk implements the client side of the ZKTeco "standalone SDK"
 // binary protocol (TCP port 4370) used by K14, K14 Pro, K40, MB-series and
 // most other ZKTeco/ZKSoftware terminals.
 //
 // The wire format is ported from pyzk (https://github.com/fananimi/pyzk),
 // including its quirks (checksum arithmetic, reply-id handling), because
 // that is what real devices are known to accept.
-package zk
+package sdk
 
 import (
 	"encoding/binary"
@@ -32,6 +32,7 @@ const (
 	CmdDisableDevice  = 1003
 	CmdRestart        = 1004
 	CmdRefreshData    = 1013
+	CmdRefreshOption  = 1014
 	CmdGetVersion     = 1100
 	CmdAuth           = 1102
 	CmdPrepareData    = 1500

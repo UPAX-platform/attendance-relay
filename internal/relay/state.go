@@ -1,8 +1,6 @@
 package relay
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,24 +9,24 @@ import (
 	"strings"
 	"time"
 
-	"github.com/UPAX-platform/zk-relay/internal/zk"
+	"github.com/UPAX-platform/attendance-relay/internal/device"
 )
 
-// State remembers how far each device's log has been uploaded, so restarts
-// never re-send or skip punches.
+// State remembers how far each pulled terminal's log has been uploaded, so
+// restarts never skip punches.
 type State struct {
 	Serial      string `json:"serial"`
 	Initialized bool   `json:"initialized"`
-	// Count is the position (1-based) in the device log of the last
+	// Count is the position (1-based) in the terminal log of the last
 	// uploaded record; LastKey/LastTime identify that record so we can
 	// detect the log being cleared or rolled over.
 	Count    int       `json:"count"`
 	LastKey  string    `json:"last_key,omitempty"`
 	LastTime time.Time `json:"last_time,omitempty"`
 	Uploaded int64     `json:"uploaded_total"`
-	// Address identifies the UPAX device address the log was uploaded to
-	// (addressID), so a device moved to another UPAX record starts over.
-	Address      string    `json:"address,omitempty"`
+	// DeviceID is the UPAX device record the log was uploaded to. A
+	// terminal re-added in UPAX as a new record starts over.
+	DeviceID     string    `json:"device_id,omitempty"`
 	LastUploadAt time.Time `json:"last_upload_at,omitempty"`
 
 	path string
@@ -78,14 +76,14 @@ func (s *State) save() error {
 	return os.Rename(tmp, s.path)
 }
 
-func (s *State) markUploaded(pos int, r zk.Record) {
+func (s *State) markUploaded(pos int, r device.Punch) {
 	s.Count = pos
 	s.LastKey = recordKey(r)
 	s.LastTime = r.Time
 }
 
-func recordKey(r zk.Record) string {
-	return fmt.Sprintf("%s|%s|%d|%d", r.UserID, r.Time.Format(time.DateTime), r.Verify, r.Punch)
+func recordKey(r device.Punch) string {
+	return fmt.Sprintf("%s|%s|%d|%d", r.PIN, r.Time.Format(time.DateTime), r.Verify, r.State)
 }
 
 // plan decides which records (by index) still need uploading.
@@ -93,10 +91,7 @@ func recordKey(r zk.Record) string {
 // UPAX skips a punch it already has (same device, PIN, time and state), so
 // whenever the relay can't tell exactly where it left off it re-sends rather
 // than guesses: a duplicate costs bandwidth, a skipped punch is lost.
-// serverStamp (UPAX's ATTLOGStamp) only says whether UPAX has punches from
-// this device at all. It is not used as a log position, because the log may
-// have been cleared or rolled since it was set.
-func plan(recs []zk.Record, st *State, serverStamp int64, backfill string) (idx []int, note string) {
+func plan(recs []device.Punch, st *State, backfill string) (idx []int, note string) {
 	n := len(recs)
 	from := func(start int) []int {
 		out := make([]int, 0, n-start)
@@ -123,11 +118,6 @@ func plan(recs []zk.Record, st *State, serverStamp int64, backfill string) (idx 
 				}
 			}
 			note = fmt.Sprintf("first run: skipping %d records before %s, uploading %d (backfill: %s)", start, since.Format(time.DateOnly), n-start, backfill)
-		case serverStamp > 0:
-			// UPAX already has punches from this device but the relay has
-			// no record of sending them (a reinstall, or another machine):
-			// re-send the log so nothing made in between is missed.
-			note = fmt.Sprintf("first run: UPAX already has punches from this device; re-sending all %d stored records (UPAX skips the ones it has)", n)
 		case backfill == "none":
 			start = n
 			note = fmt.Sprintf("first run: skipping %d historic records (backfill: none)", n)
@@ -150,19 +140,12 @@ func plan(recs []zk.Record, st *State, serverStamp int64, backfill string) (idx 
 	for i := n - 1; i >= 0; i-- {
 		if recordKey(recs[i]) == st.LastKey {
 			st.Count = i + 1
-			return from(i + 1), fmt.Sprintf("device log shifted; last uploaded record now at position %d", i+1)
+			return from(i + 1), fmt.Sprintf("terminal log shifted; last uploaded record now at position %d", i+1)
 		}
 	}
 	// The last uploaded record is gone, so everything left is either newer
 	// or already in UPAX. Times can't decide which: the clock may have been
 	// set back. Send it all.
 	st.Count = 0
-	return from(0), fmt.Sprintf("device log was cleared or replaced; re-sending all %d records (UPAX skips the ones it has)", n)
-}
-
-// addressID identifies a UPAX device address without storing it: the
-// address carries the device token, a credential.
-func addressID(u string) string {
-	sum := sha256.Sum256([]byte(strings.TrimRight(strings.TrimSpace(u), "/")))
-	return hex.EncodeToString(sum[:8])
+	return from(0), fmt.Sprintf("terminal log was cleared or replaced; re-sending all %d records (UPAX skips the ones it has)", n)
 }

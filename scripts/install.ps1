@@ -1,4 +1,4 @@
-# UPAX ZKTeco relay installer for Windows.
+# UPAX attendance relay installer for Windows.
 # Run in PowerShell opened with "Run as administrator":
 #
 #   irm https://<host>/install.ps1 | iex
@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$BaseUrl = if ($env:UPAX_RELAY_BASE_URL) { $env:UPAX_RELAY_BASE_URL } else { 'https://github.com/UPAX-platform/zk-relay/releases/latest/download' }
+$BaseUrl = if ($env:UPAX_RELAY_BASE_URL) { $env:UPAX_RELAY_BASE_URL } else { 'https://github.com/UPAX-platform/attendance-relay/releases/latest/download' }
 $InstallDir = Join-Path $env:ProgramFiles 'UPAX Relay'
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())

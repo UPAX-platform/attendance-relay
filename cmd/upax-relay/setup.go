@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,10 +15,11 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/UPAX-platform/zk-relay/internal/adms"
-	"github.com/UPAX-platform/zk-relay/internal/config"
-	"github.com/UPAX-platform/zk-relay/internal/relay"
-	"github.com/UPAX-platform/zk-relay/internal/zk"
+	"github.com/UPAX-platform/attendance-relay/internal/config"
+	"github.com/UPAX-platform/attendance-relay/internal/device"
+	"github.com/UPAX-platform/attendance-relay/internal/identity"
+	"github.com/UPAX-platform/attendance-relay/internal/relay"
+	"github.com/UPAX-platform/attendance-relay/internal/upax"
 )
 
 var stdin = bufio.NewReader(os.Stdin)
@@ -55,47 +57,31 @@ func yes(q string, def bool) bool {
 	return a == "y" || a == "yes"
 }
 
-type deviceInfo struct {
-	serial, firmware string
-	sizes            zk.Sizes
-	clock            time.Time
+func isTTY() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
-func probeDevice(ctx context.Context, d config.Device) (deviceInfo, error) {
-	c, err := zk.Dial(ctx, d.Addr(), d.Password, 8*time.Second)
+type terminalInfo struct {
+	device.Info
+	clock time.Time
+}
+
+func probeTerminal(ctx context.Context, t config.Terminal) (terminalInfo, error) {
+	drv, err := device.Lookup(t.Vendor)
 	if err != nil {
-		return deviceInfo{}, err
+		return terminalInfo{}, err
+	}
+	c, err := drv.Dial(ctx, t.Target(), 8*time.Second)
+	if err != nil {
+		return terminalInfo{}, err
 	}
 	defer c.Close()
-	var in deviceInfo
-	if in.serial, err = c.SerialNumber(); err != nil {
+	var in terminalInfo
+	if in.Info, err = c.Info(); err != nil {
 		return in, err
 	}
-	in.firmware, _ = c.Firmware()
-	in.sizes, _ = c.Sizes()
-	in.clock, _ = c.Time()
+	in.clock, _ = c.Clock()
 	return in, nil
-}
-
-// probeUPAX handshakes as the device. It carries the device summary, so a
-// device UPAX hasn't activated yet shows its firmware next to the serial.
-func probeUPAX(ctx context.Context, url string, d config.Device, in deviceInfo) (adms.Options, error) {
-	ac := &adms.Client{Base: url, SN: in.serial, UserAgent: "upax-zk-relay/" + version}
-	info := fmt.Sprintf("%s,%d,%d,%d,%s", in.firmware, in.sizes.Users, in.sizes.Fingers, in.sizes.Records, d.Host)
-	return ac.Handshake(ctx, info)
-}
-
-// describeStatus explains a device's UPAX status in one line.
-func describeStatus(o adms.Options, serial string) string {
-	switch o.Status {
-	case adms.StatusActive:
-		return "active, UPAX accepts punches from this device"
-	case adms.StatusPending:
-		return fmt.Sprintf("waiting for activation: open HR > Devices in UPAX and activate the device with serial %s. Punches stay on the device until then", serial)
-	case adms.StatusPaused:
-		return "paused in UPAX: resume the device there to upload punches"
-	}
-	return "ok"
 }
 
 func splitHostPort(s string) (string, int) {
@@ -108,127 +94,96 @@ func splitHostPort(s string) (string, int) {
 
 func cmdSetup(args []string) error {
 	fs, path := newFlags("setup")
-	url := fs.String("url", "", "UPAX device address, e.g. https://upax.example.com/<device-address>")
-	dev := fs.String("device", "", "device IP or host[:port]")
-	pw := fs.Uint("password", 0, "device communication password (comm key), if one is set")
-	name := fs.String("name", "", "friendly name for the device")
-	backfill := fs.String("backfill", "", "first run: upload stored history (all), only new punches (none), or history from a date (since:YYYY-MM-DD)")
+	base := fs.String("upax", "", "UPAX address, e.g. https://<your-org>.upax.io")
+	code := fs.String("code", "", "pairing code from UPAX (RLY-XXXX-XXXX-XXXX)")
+	newKey := fs.Bool("new-key", false, "pair with a new key even if this relay has one")
+	termFlag := fs.String("terminal", "", "terminal IP or host[:port] to add")
+	vendor := fs.String("vendor", device.DefaultVendor, "terminal vendor")
+	pw := fs.Uint("password", 0, "terminal comm key, if one is set")
+	name := fs.String("name", "", "friendly name for the terminal")
+	backfill := fs.String("backfill", "", "first upload from a terminal: stored history (all), only new punches (none), or since:YYYY-MM-DD")
+	listener := fs.String("listener", "", "receive from push-capable terminals on the LAN: yes or no")
 	install := fs.String("install", "ask", "install and start the background service: yes, no or ask")
 	_ = fs.Parse(args)
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
-	fmt.Println("UPAX ZKTeco relay setup")
-	fmt.Println("=======================")
+	fmt.Println("UPAX attendance relay setup")
+	fmt.Println("===========================")
 
 	cfg, err := config.Load(*path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		cfg = config.New(*path)
-	case cfg == nil:
+	case err != nil:
+		return wrapPerm(err)
+	}
+
+	// 1. UPAX and pairing.
+	if *base != "" {
+		cfg.UPAX = strings.TrimRight(strings.TrimSpace(*base), "/")
+	}
+	if cfg.UPAX == "" {
+		fmt.Println("\nThe UPAX address is your organisation's UPAX domain, e.g. https://<your-org>.upax.io")
+		cfg.UPAX = strings.TrimRight(prompt("UPAX address", ""), "/")
+	}
+	if err := upax.ValidateBase(cfg.UPAX); err != nil {
 		return err
 	}
+	if _, err := identity.Load(cfg.KeyPath()); cfg.RelayID != "" && err == nil && !*newKey && *code == "" {
+		k, _ := identity.Load(cfg.KeyPath())
+		fmt.Printf("\nThis relay is already paired (fingerprint %s).\n", identity.Group(k.Fingerprint()))
+	} else {
+		if *code == "" {
+			fmt.Println("\nCreate a pairing code in UPAX: HR › Devices › Relays › Add relay.")
+			*code = prompt("Pairing code", "")
+		}
+		k, _, err := pair(ctx, cfg, *code, *newKey)
+		if err != nil {
+			return err
+		}
+		printFingerprint(k)
+	}
 
-	// 1. the device
-	d := config.Device{Name: *name, Password: uint32(*pw)}
-	host := *dev
-	if host == "" {
-		fmt.Println("\nThe relay talks to the device over your local network (TCP port 4370).")
-		fmt.Println("Find its IP on the device: Menu > Comm. > Ethernet. Leave blank to scan the network.")
-		host = prompt("Device IP address", "")
-		if host == "" {
-			found := scanNetwork(ctx, "", true)
-			if len(found) == 0 {
-				return errors.New("no ZKTeco devices found; make sure the device is on the same network and enter its IP")
+	// 2. Terminals pulled over the LAN.
+	added := 0
+	if *termFlag != "" {
+		h, p := splitHostPort(*termFlag)
+		if err := addTerminal(ctx, cfg, config.Terminal{Name: *name, Vendor: vendorOrEmpty(*vendor), Host: h, Port: p, Password: uint32(*pw)}); err != nil {
+			return err
+		}
+		added++
+	} else if isTTY() {
+		fmt.Println("\nThe relay reads terminals over your local network (ZKTeco: TCP port 4370).")
+		for _, t := range cfg.Terminals {
+			fmt.Printf("  configured: %s\n", t.Label())
+		}
+		ask := "Add a terminal"
+		def := len(cfg.Terminals) == 0
+		if !def {
+			ask = "Add another terminal"
+		}
+		for yes(ask+"?", def) {
+			if err := addTerminalInteractive(ctx, cfg); err != nil {
+				fmt.Println("  ", err)
+			} else {
+				added++
 			}
-			host = found[0].addr
-			if len(found) > 1 {
-				for i, f := range found {
-					fmt.Printf("  %d) %s  %s\n", i+1, f.addr, f.serial)
-				}
-				n, _ := strconv.Atoi(prompt("Which device", "1"))
-				if n < 1 || n > len(found) {
-					n = 1
-				}
-				host = found[n-1].addr
-			}
+			ask, def = "Add another terminal", false
 		}
 	}
-	d.Host, d.Port = splitHostPort(host)
 
-	var info deviceInfo
-	for {
-		fmt.Printf("\nConnecting to device %s ... ", d.Addr())
-		info, err = probeDevice(ctx, d)
-		if err == nil {
-			break
-		}
-		fmt.Println("failed")
-		if errors.Is(err, zk.ErrUnauthorized) && isTTY() {
-			fmt.Println("The device has a communication password (Menu > Comm. > PC Connection > Comm Key).")
-			n, perr := strconv.ParseUint(prompt("Comm key", ""), 10, 32)
-			if perr != nil {
-				return fmt.Errorf("comm key must be a number")
-			}
-			d.Password = uint32(n)
-			continue
-		}
-		if errors.Is(err, zk.ErrUnauthorized) {
-			return fmt.Errorf("%s: %w; pass it with --password", d.Addr(), err)
-		}
-		return fmt.Errorf("could not connect to %s: %w", d.Addr(), err)
-	}
-	fmt.Println("ok")
-	fmt.Printf("  serial %s, firmware %s, %d users, %d stored punches\n", info.serial, info.firmware, info.sizes.Users, info.sizes.Records)
-	warnClock(info.clock)
-
-	// 2. UPAX address
-	existing := ""
-	for _, e := range cfg.Devices {
-		if e.Host == d.Host && e.Port == d.Port {
-			existing = cfg.URLFor(e)
-			if d.Name == "" {
-				d.Name = e.Name
-			}
-		}
-	}
-	u := *url
-	if u == "" {
-		fmt.Println("\nPaste the device address UPAX gave you for this device")
-		fmt.Println("(looks like https://upax.example.com/<device-address>).")
-		u = prompt("UPAX device address", existing)
-	}
-	u = strings.TrimRight(strings.TrimSpace(u), "/")
-	if err := config.ValidateURL(u); err != nil {
-		return err
-	}
-	if existing != "" && existing != u {
-		fmt.Println("  This device was set up with a different UPAX address. If the new address is a new")
-		fmt.Println("  device in UPAX, the relay uploads the device's punches to it again (see backfill).")
-	}
-	fmt.Printf("\nChecking UPAX ... ")
-	opts, err := probeUPAX(ctx, u, d, info)
-	if err != nil {
-		fmt.Println("failed")
-		if adms.IsNotFound(err) {
-			return fmt.Errorf("UPAX does not recognise %s — double-check the address", u)
-		}
-		return fmt.Errorf("could not reach UPAX: %w", err)
-	}
-	fmt.Println("ok")
-	fmt.Println("  " + describeStatus(opts, info.serial))
-	if opts.ATTLOGStamp > 0 {
-		fmt.Println("  UPAX already has punches from this device; any the relay re-sends are skipped there.")
-	}
-	d.UpaxURL = u
-
-	// 3. history
+	// 3. History.
 	if *backfill != "" {
+		if err := config.ValidateBackfill(*backfill); err != nil {
+			return err
+		}
 		cfg.Backfill = *backfill
-	} else if info.sizes.Records > 0 && opts.ATTLOGStamp == 0 && isTTY() {
-		fmt.Printf("\nThe device holds %d past punches. Upload them to UPAX on first start?\n", info.sizes.Records)
+	} else if added > 0 && isTTY() {
+		fmt.Println("\nOn first contact, upload the punches already stored on new terminals?")
 		fmt.Println("  all = every stored punch, none = only new punches, since:YYYY-MM-DD = from that date")
 		for {
-			b := prompt("Upload", "all")
+			b := prompt("Upload", cfg.Backfill)
 			if err := config.ValidateBackfill(b); err != nil {
 				fmt.Println(" ", err)
 				continue
@@ -238,25 +193,34 @@ func cmdSetup(args []string) error {
 		}
 	}
 
-	// 4. save
-	replaced := false
-	for i, e := range cfg.Devices {
-		if e.Host == d.Host && e.Port == d.Port {
-			cfg.Devices[i], replaced = d, true
+	// 4. Push terminals (opt-in).
+	switch *listener {
+	case "yes":
+		cfg.Listener.Enabled = true
+	case "no":
+		cfg.Listener.Enabled = false
+	case "":
+		if isTTY() && !cfg.Listener.Enabled {
+			fmt.Println("\nPush-capable terminals can send to this relay instead of to UPAX directly, so")
+			fmt.Println("they need no internet access and hold no UPAX credential.")
+			cfg.Listener.Enabled = yes("Receive from push terminals on this network?", false)
 		}
+	default:
+		return fmt.Errorf("--listener must be yes or no")
 	}
-	if !replaced {
-		cfg.Devices = append(cfg.Devices, d)
+	if cfg.Listener.Enabled {
+		fmt.Printf("  Point each push terminal's cloud server setting at this computer's LAN address, port %s.\n", listenerPort(cfg.Listener.Bind))
 	}
+
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
 	if err := cfg.Save(); err != nil {
-		return err
+		return wrapPerm(err)
 	}
 	fmt.Printf("\nSaved %s\n", cfg.Path())
 
-	// 5. service
+	// 5. Service.
 	doInstall := *install == "yes" || (*install == "ask" && isTTY() && yes("Install and start the relay as a background service?", true))
 	if !doInstall {
 		fmt.Printf("\nInstall and start the service later with:  upax-relay install --config %q && upax-relay start\n", cfg.Path())
@@ -266,7 +230,7 @@ func cmdSetup(args []string) error {
 	if err := installAndStart(cfg.Path()); err != nil {
 		return err
 	}
-	if err := waitForService(cfg, d, started); err != nil {
+	if err := waitForService(ctx, cfg, started); err != nil {
 		return err
 	}
 	fmt.Println("\nDone. The relay runs in the background and starts automatically at boot.")
@@ -274,28 +238,123 @@ func cmdSetup(args []string) error {
 	return nil
 }
 
-// waitForService waits for the freshly started service to reach UPAX for d,
-// so setup reports what actually happened rather than that it started.
-func waitForService(cfg *config.Config, d config.Device, since time.Time) error {
-	fmt.Print("\nWaiting for the relay service to reach UPAX ... ")
-	path := relay.HealthPath(cfg.StateDir(), d.Addr())
-	deadline := time.Now().Add(90 * time.Second)
-	for {
-		h, err := relay.LoadHealth(path)
-		fresh := err == nil && h.StartedAt.After(since)
-		switch {
-		case fresh && h.LastHandshake.After(since):
-			fmt.Println("ok")
-			status := h.UPAXStatus
-			if status == "unknown" {
-				status = ""
+func vendorOrEmpty(v string) string {
+	if v == device.DefaultVendor {
+		return ""
+	}
+	return v
+}
+
+func listenerPort(bind string) string {
+	_, p, err := net.SplitHostPort(bind)
+	if err != nil {
+		return bind
+	}
+	return p
+}
+
+func addTerminalInteractive(ctx context.Context, cfg *config.Config) error {
+	fmt.Println("Find the terminal's IP on it (ZKTeco: Menu › Comm. › Ethernet). Leave blank to scan the network.")
+	host := prompt("Terminal IP address", "")
+	vendor := ""
+	if host == "" {
+		found := scanNetwork(ctx, "", true)
+		if len(found) == 0 {
+			return errors.New("no terminals found; make sure the terminal is on the same network and enter its IP")
+		}
+		for i, f := range found {
+			fmt.Printf("  %d) %s:%d  %s  %s\n", i+1, f.addr, f.port, f.vendor, f.serial)
+		}
+		n, _ := strconv.Atoi(prompt("Which terminal", "1"))
+		if n < 1 || n > len(found) {
+			n = 1
+		}
+		host, vendor = net.JoinHostPort(found[n-1].addr, strconv.Itoa(found[n-1].port)), vendorOrEmpty(found[n-1].vendor)
+	}
+	h, p := splitHostPort(host)
+	t := config.Terminal{Vendor: vendor, Host: h, Port: p}
+	t.Name = prompt("Name for this terminal (e.g. Front door)", t.Label())
+	if t.Name == t.Addr() {
+		t.Name = ""
+	}
+	return addTerminal(ctx, cfg, t)
+}
+
+// addTerminal connects to t (asking for its comm key if needed) and adds
+// or replaces it in cfg.
+func addTerminal(ctx context.Context, cfg *config.Config, t config.Terminal) error {
+	for _, e := range cfg.Terminals {
+		if e.Addr() == t.Addr() {
+			if t.Name == "" {
+				t.Name = e.Name
 			}
-			fmt.Println("  " + describeStatus(adms.Options{Status: status}, h.Serial))
-			return nil
-		case fresh && h.UPAXStatus == "rejected":
-			fmt.Println("failed")
-			return errors.New("UPAX rejected the device address; check it in UPAX and run setup again")
-		case time.Now().After(deadline):
+			if t.Password == 0 {
+				t.Password = e.Password
+			}
+			t.ManageCommKey = e.ManageCommKey
+		}
+	}
+	var info terminalInfo
+	var err error
+	for {
+		fmt.Printf("Connecting to %s ... ", t.Addr())
+		info, err = probeTerminal(ctx, t)
+		if err == nil {
+			break
+		}
+		fmt.Println("failed")
+		if errors.Is(err, device.ErrUnauthorized) && isTTY() {
+			fmt.Println("The terminal has a comm key (ZKTeco: Menu › Comm. › PC Connection › Comm Key).")
+			n, perr := strconv.ParseUint(prompt("Comm key", ""), 10, 32)
+			if perr != nil {
+				return fmt.Errorf("the comm key is a number")
+			}
+			t.Password = uint32(n)
+			continue
+		}
+		if errors.Is(err, device.ErrUnauthorized) {
+			return fmt.Errorf("%s: %w; pass it with --password", t.Addr(), err)
+		}
+		return fmt.Errorf("could not connect to %s: %w", t.Addr(), err)
+	}
+	fmt.Println("ok")
+	fmt.Printf("  serial %s, %s, firmware %s, %d users, %d stored punches\n", info.Serial, orUnknown(info.Model), info.Firmware, info.Users, info.Records)
+	warnClock(info.clock)
+	replaced := false
+	for i, e := range cfg.Terminals {
+		if e.Addr() == t.Addr() {
+			cfg.Terminals[i], replaced = t, true
+		}
+	}
+	if !replaced {
+		cfg.Terminals = append(cfg.Terminals, t)
+	}
+	fmt.Println("  Once the relay reports it, add it in UPAX from the relay's discovered terminals.")
+	return nil
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "model unknown"
+	}
+	return s
+}
+
+// waitForService waits for the freshly started service to reach UPAX, then
+// (in a terminal) for the relay to be activated, so setup reports what
+// actually happened rather than that it started.
+func waitForService(ctx context.Context, cfg *config.Config, since time.Time) error {
+	fmt.Print("\nWaiting for the relay service to reach UPAX ... ")
+	deadline := time.Now().Add(90 * time.Second)
+	var h *relay.RelayHealth
+	for {
+		var err error
+		h, err = relay.LoadRelayHealth(cfg.StateDir())
+		fresh := err == nil && h.StartedAt.After(since)
+		if fresh && (h.LastSync.After(since) || h.UPAXStatus == "unpaired" || h.UPAXStatus == "signature_invalid") {
+			break
+		}
+		if time.Now().After(deadline) {
 			fmt.Println("no contact")
 			if fresh && h.LastError != "" {
 				fmt.Println("  last error:", h.LastError)
@@ -304,7 +363,36 @@ func waitForService(cfg *config.Config, d config.Device, since time.Time) error 
 			}
 			return fmt.Errorf("the relay service has not reached UPAX yet; see %s", filepath.Join(cfg.StateDir(), "relay.log"))
 		}
-		time.Sleep(time.Second)
+		if !sleepCtx(ctx, time.Second) {
+			fmt.Println()
+			return nil
+		}
+	}
+	fmt.Println("ok")
+	fmt.Println("  " + describeRelay(h.UPAXStatus))
+	if h.UPAXStatus != upax.StatusPending || !isTTY() {
+		return nil
+	}
+	fmt.Print("\nWaiting for activation in UPAX (Ctrl-C to finish setup now; the service keeps waiting) ... ")
+	for {
+		if !sleepCtx(ctx, 2*time.Second) {
+			fmt.Println("\n  Setup is done; the relay starts uploading once UPAX activates it.")
+			return nil
+		}
+		if h, err := relay.LoadRelayHealth(cfg.StateDir()); err == nil && h.UPAXStatus != upax.StatusPending {
+			fmt.Println("ok")
+			fmt.Println("  " + describeRelay(h.UPAXStatus))
+			return nil
+		}
+	}
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
 	}
 }
 
@@ -315,51 +403,91 @@ func warnClock(t time.Time) {
 	now := time.Now()
 	local := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second(), 0, time.UTC)
 	if skew := t.Sub(local); skew > 2*time.Minute || skew < -2*time.Minute {
-		fmt.Printf("  warning: device clock (%s) differs from this computer (%s) by %s — punches are sent with the device's time\n",
+		fmt.Printf("  warning: the terminal clock (%s) differs from this computer (%s) by %s; punches carry the terminal's time.\n",
 			t.Format(time.DateTime), local.Format(time.DateTime), skew.Round(time.Second))
+		fmt.Println("  UPAX can keep it right: turn on clock sync for the terminal in UPAX.")
 	}
-}
-
-func isTTY() bool {
-	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
 func cmdTest(args []string) error {
 	fs, path := newFlags("test")
 	_ = fs.Parse(args)
-	cfg, err := config.Load(*path)
+	cfg, _, api, err := loadPaired(*path)
 	if err != nil {
-		return err
+		return wrapPerm(err)
 	}
 	ctx := context.Background()
 	failed := false
-	for _, d := range cfg.Devices {
-		fmt.Printf("%s\n  device %s ... ", d.Label(), d.Addr())
-		info, err := probeDevice(ctx, d)
+	var reports []upax.TerminalReport
+	for _, t := range cfg.Terminals {
+		fmt.Printf("%s\n  terminal %s ... ", t.Label(), t.Addr())
+		info, err := probeTerminal(ctx, t)
 		if err != nil {
 			fmt.Println("FAILED:", err)
 			failed = true
 			continue
 		}
-		fmt.Printf("ok (serial %s, firmware %s, %d punches)\n", info.serial, info.firmware, info.sizes.Records)
+		fmt.Printf("ok (serial %s, firmware %s, %d punches)\n", info.Serial, info.Firmware, info.Records)
 		warnClock(info.clock)
-		sn := info.serial
-		if d.Serial != "" {
-			sn = d.Serial
+		reports = append(reports, upax.TerminalReport{
+			Serial: info.Serial, Vendor: t.VendorName(), LANAddr: t.Host, Connection: upax.ConnPull, Reachable: true,
+			Model: info.Model, Firmware: info.Firmware, Users: info.Users, Fingerprints: info.Fingerprints, Records: info.Records,
+		})
+	}
+	fmt.Printf("UPAX %s ... ", cfg.UPAX)
+	rep, err := api.Sync(ctx, upax.SyncRequest{Version: version, HostName: hostName(), Terminals: reports})
+	if err != nil {
+		fmt.Println("FAILED:", explainAPI(err))
+		return errors.New("some checks failed")
+	}
+	fmt.Println("ok (signed request accepted)")
+	fmt.Println("  " + describeRelay(rep.Status))
+	if off, ok := api.ClockOffset(); ok && (off > 30*time.Second || off < -30*time.Second) {
+		fmt.Printf("  warning: this computer's clock is %s off UPAX's; turn on automatic time\n", off)
+	}
+	registered := map[string]upax.TerminalState{}
+	for _, t := range rep.Terminals {
+		registered[t.Serial] = t
+	}
+	for _, r := range reports {
+		if st, ok := registered[r.Serial]; ok {
+			fmt.Printf("  terminal %s: %s in UPAX\n", r.Serial, st.Status)
+		} else if rep.Status == upax.StatusActive {
+			fmt.Printf("  terminal %s: not added in UPAX yet (add it from the relay's discovered terminals)\n", r.Serial)
 		}
-		fmt.Printf("  UPAX %s ... ", cfg.URLFor(d))
-		info.serial = sn
-		opts, err := probeUPAX(ctx, cfg.URLFor(d), d, info)
-		if err != nil {
-			fmt.Println("FAILED:", err)
-			failed = true
-			continue
-		}
-		fmt.Printf("ok (heartbeat %s, transfers %q)\n", opts.Delay, opts.TransFlag)
-		fmt.Println("  " + describeStatus(opts, sn))
 	}
 	if failed {
 		return errors.New("some checks failed")
 	}
 	return nil
+}
+
+func explainAPI(err error) string {
+	switch {
+	case upax.IsStatus(err, 404):
+		return "UPAX doesn't know this relay (unpaired or retired); pair it again with: upax-relay pair"
+	case upax.IsCode(err, upax.CodeClockSkew):
+		return "this computer's clock is too far off; turn on automatic time"
+	case upax.IsStatus(err, 401):
+		return "UPAX refused the relay's signature; pair it again with: upax-relay pair"
+	}
+	return err.Error()
+}
+
+func describeRelay(status string) string {
+	switch status {
+	case upax.StatusActive:
+		return "active: UPAX accepts punches through this relay"
+	case upax.StatusPending:
+		return "waiting for activation: in UPAX, open HR › Devices › Relays, check the fingerprint matches, and activate. Punches stay on the terminals until then"
+	case upax.StatusPaused:
+		return "paused in UPAX: resume the relay there to upload punches"
+	case "unpaired":
+		return "UPAX doesn't know this relay (unpaired or retired); pair it again with: upax-relay pair"
+	case "signature_invalid":
+		return "UPAX refused the relay's signature; pair it again with: upax-relay pair"
+	case "":
+		return "not reached UPAX yet"
+	}
+	return status
 }

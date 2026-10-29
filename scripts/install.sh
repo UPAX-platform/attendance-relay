@@ -1,5 +1,5 @@
 #!/bin/sh
-# UPAX ZKTeco relay installer for Linux and macOS.
+# UPAX attendance relay installer for Linux and macOS.
 #
 #   curl -fsSL https://<host>/install.sh | sh
 #
@@ -8,7 +8,7 @@
 #   UPAX_RELAY_SKIP_SETUP=1  only install the binary
 set -eu
 
-BASE_URL="${UPAX_RELAY_BASE_URL:-https://github.com/UPAX-platform/zk-relay/releases/latest/download}"
+BASE_URL="${UPAX_RELAY_BASE_URL:-https://github.com/UPAX-platform/attendance-relay/releases/latest/download}"
 BIN_DIR="/usr/local/bin"
 
 say() { printf '%s\n' "$*"; }
