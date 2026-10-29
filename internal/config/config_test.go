@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -84,7 +85,8 @@ func TestSaveRoundTrip(t *testing.T) {
 	if !strings.HasPrefix(string(b), "# UPAX attendance relay") || !strings.Contains(string(b), "version: 2") {
 		t.Fatalf("file:\n%s", b)
 	}
-	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o600 {
+	// Windows has no mode bits; scripts/windows-check.ps1 checks the ACLs.
+	if fi, _ := os.Stat(p); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %v", fi.Mode().Perm())
 	}
 }

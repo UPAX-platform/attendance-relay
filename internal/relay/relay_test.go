@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -601,7 +602,8 @@ func TestHealthHoldsNoSecrets(t *testing.T) {
 		if strings.Contains(string(b), strings.TrimSpace(string(seed))) {
 			t.Fatalf("%s contains the key", f)
 		}
-		if fi, _ := os.Stat(f); fi.Mode().Perm() != 0o644 {
+		// Windows has no mode bits; scripts/windows-check.ps1 checks the ACLs.
+		if fi, _ := os.Stat(f); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o644 {
 			t.Fatalf("%s mode %v", f, fi.Mode().Perm())
 		}
 	}

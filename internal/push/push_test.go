@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -75,7 +76,8 @@ func TestSpool(t *testing.T) {
 	if got[0].PIN != "4" {
 		t.Fatalf("next file %v", got)
 	}
-	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+	// Windows has no mode bits; scripts/windows-check.ps1 checks the ACLs.
+	if fi, _ := os.Stat(dir); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o700 {
 		t.Fatalf("spool dir mode %v", fi.Mode().Perm())
 	}
 }
