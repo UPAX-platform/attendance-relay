@@ -14,6 +14,13 @@ jobs:
           go-version-file: go.mod
       - run: go test -race ./...
       - run: VERSION=${GITHUB_REF_NAME#v} scripts/build-dist.sh
-      - run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+      # Drafted, then published once every asset is up: the installers fetch
+      # releases/latest, which must never be half-uploaded. A tag with a
+      # suffix (v2.0.0-rc1) is a pre-release, which latest skips.
+      - run: |
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --draft $pre
+          gh release edit "$GITHUB_REF_NAME" --draft=false
         env:
           GH_TOKEN: ${{ github.token }}

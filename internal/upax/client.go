@@ -258,10 +258,14 @@ func (c *Client) send(ctx context.Context, u string, key *identity.Key, body []b
 	}
 	sig.Sign(req, body, key, c.Now(), nonce)
 
-	hc := c.HTTP
-	if hc == nil {
-		hc = &http.Client{Timeout: 30 * time.Second}
+	hc := &http.Client{Timeout: 30 * time.Second}
+	if c.HTTP != nil {
+		h := *c.HTTP
+		hc = &h
 	}
+	// A redirect is answered as is: following it would re-send the signed
+	// request (or turn it into a GET) to wherever the answer points.
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	sent := time.Now()
 	resp, err := hc.Do(req)
 	if err != nil {

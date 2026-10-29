@@ -141,6 +141,28 @@ func (s *Spool) Done(name string, n int) error {
 	if err != nil {
 		return err
 	}
+	return s.drop(name, p, n)
+}
+
+// Reject sets the first n punches of file name aside, in a *.rejected file
+// kept for inspection, once UPAX has refused them.
+func (s *Spool) Reject(name string, n int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, err := s.read(name)
+	if err != nil {
+		return err
+	}
+	n = min(n, len(p))
+	aside := fmt.Sprintf("%s-%d.rejected", strings.TrimSuffix(name, ".punches"), time.Now().UnixNano())
+	if err := atomicfile.Write(aside, encode(p[:n]), 0o600); err != nil {
+		return err
+	}
+	return s.drop(name, p, n)
+}
+
+// drop removes the first n of file name's punches p.
+func (s *Spool) drop(name string, p []device.Punch, n int) error {
 	n = min(n, len(p))
 	s.pending -= n
 	if n == len(p) {

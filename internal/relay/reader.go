@@ -214,7 +214,7 @@ type session struct {
 	lastFull   time.Time
 	retryAfter time.Time
 	dirty      bool
-	batch      int
+	batch      batching
 	// recs/idx are the log and the indexes still to upload, kept after a
 	// failed upload so the retry doesn't download the log again.
 	recs []device.Punch
@@ -234,7 +234,10 @@ func (rd *reader) dial(ctx context.Context) (device.Conn, error) {
 	conn, err := rd.drv.Dial(ctx, target, terminalTimeout)
 	rd.mu.Lock()
 	justSet := rd.keyJustSet
-	rd.keyJustSet = false
+	if err == nil || errors.Is(err, device.ErrUnauthorized) {
+		// The terminal answered: the key is settled either way.
+		rd.keyJustSet = false
+	}
 	rd.mu.Unlock()
 	if errors.Is(err, device.ErrUnauthorized) && justSet {
 		// The terminal didn't take the comm key the relay set: if it still
@@ -336,12 +339,19 @@ func (rd *reader) manageCommKey(conn device.Conn) error {
 		return nil
 	}
 	if err := ks.SetCommKey(key); err != nil {
+		if device.IsNetErr(err) {
+			// The terminal may have taken the key before the connection
+			// broke: keep it, and let the next dial try it and no key.
+			rd.mu.Lock()
+			rd.keyJustSet = true
+			rd.mu.Unlock()
+			rd.log.Warn("lost the terminal while setting a comm key; reconnecting to see whether it took", "err", err)
+			rd.fail(fmt.Errorf("set comm key: %w", err))
+			return deviceError{err}
+		}
 		_ = rd.r.cfg.SetPassword(rd.addr, 0)
 		rd.log.Warn("the terminal refused a comm key; it keeps working without one", "err", err)
 		rd.fail(fmt.Errorf("set comm key: %w", err))
-		if device.IsNetErr(err) {
-			return deviceError{err}
-		}
 		return nil
 	}
 	rd.mu.Lock()
@@ -425,13 +435,15 @@ func (s *session) checkDeviceID() error {
 // sync downloads the log and uploads anything new. Terminal errors end the
 // session; upload errors are retried on a later poll.
 func (s *session) sync(ctx context.Context) error {
-	recs, err := s.conn.Punches()
-	if err != nil {
-		return deviceError{fmt.Errorf("read attendance: %w", err)}
-	}
+	// Count first: a punch made during the download then shows up as a
+	// new record at the next poll instead of waiting for the full check.
 	info, err := s.conn.Info()
 	if err != nil {
 		return deviceError{err}
+	}
+	recs, err := s.conn.Punches()
+	if err != nil {
+		return deviceError{fmt.Errorf("read attendance: %w", err)}
 	}
 	s.rd.setInfo(info)
 	s.records = info.Records
@@ -458,9 +470,18 @@ func (s *session) flush(ctx context.Context) error {
 		punches[i] = s.recs[j]
 	}
 	sent := 0
-	err := s.rd.r.upload(ctx, s.rd.serial(), punches, &s.batch, func(n int) error {
+	err := s.rd.r.upload(ctx, s.rd.serial(), punches, &s.batch, func(n int, refused bool) error {
 		last := s.idx[sent+n-1]
 		s.st.markUploaded(last+1, s.recs[last])
+		if refused {
+			// The punch stays on the terminal; moving past it is all.
+			if err := s.st.save(); err != nil {
+				return err
+			}
+			sent += n
+			s.rd.health.update(func(h *TerminalHealth) { h.Refused += int64(n); h.Pending = len(s.idx) - sent })
+			return nil
+		}
 		s.st.Uploaded += int64(n)
 		s.st.LastUploadAt = time.Now()
 		if err := s.st.save(); err != nil {

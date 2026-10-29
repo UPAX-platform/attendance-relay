@@ -16,9 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -110,27 +108,18 @@ func Load(path string) (*Key, error) {
 	return k, nil
 }
 
-// Save writes the key to path atomically, readable by the owner only.
+// Save writes the key to path atomically, readable by the service account
+// and administrators only.
 func (k *Key) Save(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := atomicfile.SecureDir(dir); err != nil {
 		return err
 	}
 	data := base64.StdEncoding.EncodeToString(k.priv.Seed()) + "\n"
-	return atomicfile.WriteWith(path, []byte(data), 0o600, restrict)
-}
-
-// restrict limits a file to the service account. Mode 0600 does that on
-// Unix; on Windows the file gets an explicit ACL for SYSTEM and
-// Administrators only (the service runs as LocalSystem).
-func restrict(path string) error {
-	if runtime.GOOS != "windows" {
-		return os.Chmod(path, 0o600)
-	}
-	out, err := exec.Command("icacls", path, "/inheritance:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("restrict %s: %v: %s", path, err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return atomicfile.WritePrivate(path, []byte(data))
 }
 
 // Source hands out the current key, reloading the file when it changes

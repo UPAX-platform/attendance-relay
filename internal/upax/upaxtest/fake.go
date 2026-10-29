@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,8 @@ type Fake struct {
 	MaxBatch int
 	// FailPunches answers the next n punch uploads 503.
 	FailPunches int
+	// RefusePINs answers 422 to any punch batch holding one of these PINs.
+	RefusePINs map[string]bool
 	// Refuse, if set, answers every /rly request with this status and code.
 	RefuseStatus int
 	RefuseCode   string
@@ -271,6 +274,8 @@ func (f *Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case f.FailPunches > 0:
 			f.FailPunches--
 			f.refuse(w, 503, "SERVICE_UNAVAILABLE")
+		case slices.ContainsFunc(b.Punches, func(x upax.Punch) bool { return f.RefusePINs[x.PIN] }):
+			f.refuse(w, 422, "VALIDATION_ERROR")
 		default:
 			// UPAX dedupes on terminal + PIN + local time + state.
 			have := map[upax.Punch]bool{}

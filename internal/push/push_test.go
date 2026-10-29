@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,5 +114,39 @@ func TestSpoolSkipsCorruptAndEmptyFiles(t *testing.T) {
 	}
 	if m, _ := filepath.Glob(filepath.Join(dir, "*.corrupt")); len(m) != 2 {
 		t.Fatalf("set aside %v, want the 2 unreadable files", m)
+	}
+}
+
+func TestSpoolReject(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "spool-X")
+	s, err := OpenSpool(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 10, 28, 8, 0, 0, 0, time.UTC)
+	if err := s.Append([]device.Punch{{PIN: "bad", Time: t0}, {PIN: "2", Time: t0.Add(time.Minute)}}); err != nil {
+		t.Fatal(err)
+	}
+	name, _, _, _ := s.Oldest()
+	if err := s.Reject(name, 1); err != nil {
+		t.Fatal(err)
+	}
+	if s.Pending() != 1 {
+		t.Fatalf("pending %d", s.Pending())
+	}
+	if _, got, _, _ := s.Oldest(); len(got) != 1 || got[0].PIN != "2" {
+		t.Fatalf("remaining %v", got)
+	}
+	// The refused punch is kept aside, not uploaded again.
+	aside, _ := filepath.Glob(filepath.Join(dir, "*.rejected"))
+	if len(aside) != 1 {
+		t.Fatalf("rejected files %v", aside)
+	}
+	if b, _ := os.ReadFile(aside[0]); !strings.Contains(string(b), `"bad"`) {
+		t.Fatalf("rejected file holds %s", b)
+	}
+	s2, _ := OpenSpool(dir)
+	if s2.Pending() != 1 {
+		t.Fatalf("pending after reopen %d", s2.Pending())
 	}
 }

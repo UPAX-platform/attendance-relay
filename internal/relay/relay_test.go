@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -272,6 +273,47 @@ func TestBatchHalvedOn413(t *testing.T) {
 	})
 }
 
+func TestRefusedPunchSetAside(t *testing.T) {
+	h := newHarness(t)
+	h.upax.Do(func(f *upaxtest.Fake) { f.RefusePINs = map[string]bool{"bad": true} })
+	for i := 0; i < 9; i++ {
+		pin := fmt.Sprint(i)
+		if i == 4 {
+			pin = "bad"
+		}
+		h.dev.Punch(pin, t0.Add(time.Duration(i)*time.Minute), 1, 0)
+	}
+	h.start()
+	h.waitPunches(8)
+	// It isn't retried, and punches after it keep flowing.
+	h.dev.Punch("9", t0.Add(time.Hour), 1, 0)
+	h.waitPunches(9)
+	eventually(t, "refused punch counted", func() bool {
+		th, err := LoadTerminalHealth(TerminalHealthPath(h.cfg.StateDir(), h.cfg.Terminals[0].Addr()))
+		return err == nil && th.Refused == 1
+	})
+}
+
+func TestRefusalsInARowHoldUploads(t *testing.T) {
+	h := newHarness(t)
+	refuse := map[string]bool{}
+	for i := 0; i < maxRefusedInARow+3; i++ {
+		refuse[fmt.Sprint(i)] = true
+		h.dev.Punch(fmt.Sprint(i), t0.Add(time.Duration(i)*time.Minute), 1, 0)
+	}
+	h.upax.Do(func(f *upaxtest.Fake) { f.RefusePINs = refuse })
+	h.start()
+	eventually(t, "refusals capped", func() bool {
+		th, err := LoadTerminalHealth(TerminalHealthPath(h.cfg.StateDir(), h.cfg.Terminals[0].Addr()))
+		return err == nil && th.Refused == maxRefusedInARow && th.Pending == 3
+	})
+	time.Sleep(500 * time.Millisecond)
+	th, _ := LoadTerminalHealth(TerminalHealthPath(h.cfg.StateDir(), h.cfg.Terminals[0].Addr()))
+	if th.Refused != maxRefusedInARow {
+		t.Fatalf("set aside %d punches, want at most %d", th.Refused, maxRefusedInARow)
+	}
+}
+
 func TestUnpaired(t *testing.T) {
 	h := newHarness(t)
 	h.upax.Do(func(f *upaxtest.Fake) { f.Pub = nil })
@@ -438,12 +480,28 @@ func TestManagedCommKey(t *testing.T) {
 	}
 }
 
+func TestManagedCommKeyReplyLost(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.ManageCommKeys = true
+	h.dev.DropRefreshReply = true // the terminal takes the key, the reply never comes
+	h.dev.Punch("1", t0, 1, 0)
+	h.start()
+	h.waitPunches(1)
+	k := h.dev.CommKey()
+	if k == 0 {
+		t.Fatal("terminal has no comm key")
+	}
+	if saved, _ := config.Load(h.cfg.Path()); saved.Terminals[0].Password != k {
+		t.Fatalf("config has %d, terminal %d: the relay lost the key", saved.Terminals[0].Password, k)
+	}
+}
+
 func TestKeyRotation(t *testing.T) {
 	h := newHarness(t)
 	h.dev.Punch("1", t0, 1, 0)
 	h.start()
 	h.waitPunches(1)
-	next, err := RotateKey(context.Background(), h.api, h.cfg.KeyPath())
+	next, err := RotateKey(context.Background(), h.api, h.cfg.KeyPath(), upax.SyncRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,6 +530,59 @@ func TestInterruptedRotationRecovered(t *testing.T) {
 	k, _ := identity.Load(h.cfg.KeyPath())
 	if k.Fingerprint() != next.Fingerprint() {
 		t.Fatal("rotation not finished")
+	}
+}
+
+// loseKeyReply delivers requests but loses UPAX's answer to a key upload,
+// as when the connection drops after UPAX stored the new key.
+type loseKeyReply struct{}
+
+func (loseKeyReply) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err == nil && strings.HasSuffix(req.URL.Path, "/key") {
+		resp.Body.Close()
+		return nil, errors.New("connection reset")
+	}
+	return resp, err
+}
+
+func TestRotationAnswerLost(t *testing.T) {
+	h := newHarness(t)
+	path := h.cfg.KeyPath()
+	api := &upax.Client{Base: h.cfg.UPAX, RelayID: h.cfg.RelayID, Keys: &identity.Source{Path: path}}
+	lossy := &upax.Client{Base: api.Base, RelayID: api.RelayID, Keys: api.Keys, HTTP: &http.Client{Transport: loseKeyReply{}}}
+	if _, err := RotateKey(context.Background(), lossy, path, upax.SyncRequest{}); err == nil {
+		t.Fatal("no error")
+	}
+	pending, err := identity.Load(path + ".next")
+	if err != nil {
+		t.Fatal("pending key dropped although UPAX may have it")
+	}
+	// The next try settles the pending key instead of making another one.
+	next, err := RotateKey(context.Background(), api, path, upax.SyncRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rotated int
+	h.upax.Do(func(f *upaxtest.Fake) { rotated = f.Rotated })
+	if next.Fingerprint() != pending.Fingerprint() || rotated != 1 {
+		t.Fatalf("installed %s, pending was %s; UPAX rotated %d times", next.Fingerprint(), pending.Fingerprint(), rotated)
+	}
+	if k, _ := identity.Load(path); k.Fingerprint() != pending.Fingerprint() {
+		t.Fatal("pending key not installed")
+	}
+}
+
+func TestRotationRefusedDiscardsPendingKey(t *testing.T) {
+	h := newHarness(t)
+	path := h.cfg.KeyPath()
+	api := &upax.Client{Base: h.cfg.UPAX, RelayID: h.cfg.RelayID, Keys: &identity.Source{Path: path}}
+	h.upax.Do(func(f *upaxtest.Fake) { f.RefuseStatus, f.RefuseCode = http.StatusConflict, upax.CodeNotActive })
+	if _, err := RotateKey(context.Background(), api, path, upax.SyncRequest{}); err == nil {
+		t.Fatal("no error")
+	}
+	if _, err := os.Stat(path + ".next"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("refused key kept")
 	}
 }
 
@@ -628,6 +739,30 @@ func TestPushSpoolSurvivesRestart(t *testing.T) {
 	h.upax.Do(func(f *upaxtest.Fake) { f.FailPunches = 0 })
 	h.start()
 	eventually(t, "spool uploaded after restart", func() bool { return h.upax.PunchCount(pushSerial) == 1 })
+}
+
+func TestPushStoredDespiteStampSaveFailure(t *testing.T) {
+	h := pushHarness(t)
+	h.upax.Register(pushSerial, upaxtest.Terminal{})
+	h.iclock("GET", "/iclock/cdata?SN="+pushSerial+"&options=all", "")
+	eventually(t, "registered", func() bool { ok, _ := h.relay.Accept(pushSerial); return ok })
+	h.upax.Do(func(f *upaxtest.Fake) { f.FailPunches = 1000 })
+	// meta.json can't be replaced: a directory, with something in it.
+	p := h.relay.knownPush(pushSerial)
+	_ = os.Remove(p.metaPath())
+	if err := os.MkdirAll(filepath.Join(p.metaPath(), "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		code, body, _ := h.iclock("POST", "/iclock/cdata?SN="+pushSerial+"&table=ATTLOG&Stamp=9", "7\t2026-10-28 08:00:00\t0\t1\t0\n")
+		if code != 200 || body != "OK: 1" {
+			t.Fatalf("attlog: %d %q", code, body)
+		}
+	}
+	// One spool entry per upload, not an endless re-send.
+	if n := p.spool.Pending(); n != 2 {
+		t.Fatalf("spooled %d", n)
+	}
 }
 
 func TestPushBadSerialRefused(t *testing.T) {

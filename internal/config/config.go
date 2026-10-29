@@ -279,10 +279,14 @@ func (c *Config) Save() error {
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
 		return err
 	}
+	if err := atomicfile.SecureDir(filepath.Dir(c.path)); err != nil {
+		return err
+	}
 	b, err := yaml.Marshal(c)
 	if err != nil {
 		return err
 	}
+	// It holds terminal comm keys.
 	header := "# UPAX attendance relay configuration. See README for all options.\n"
-	return atomicfile.Write(c.path, append([]byte(header), b...), 0o600)
+	return atomicfile.WritePrivate(c.path, append([]byte(header), b...))
 }

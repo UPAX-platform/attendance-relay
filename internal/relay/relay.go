@@ -523,15 +523,34 @@ type uploadOutcome struct {
 	holdTerminal bool          // UPAX says this terminal isn't active
 }
 
+// batching is one terminal's upload state.
+type batching struct {
+	size    int // punches per batch; halved on 413
+	refused int // punches set aside in a row because UPAX refused them
+}
+
+// maxRefusedInARow bounds how many punches in a row are set aside as
+// refused. Past it the refusals are taken to be the relay's fault, not the
+// punches', and uploads wait as for any other error until one gets through.
+const maxRefusedInARow = 5
+
+// punchRefused reports whether UPAX refused a batch for what it holds.
+func punchRefused(err error) bool {
+	return upax.IsStatus(err, http.StatusBadRequest) || upax.IsStatus(err, http.StatusUnprocessableEntity)
+}
+
 // upload sends punches for serial in batches, halving the batch on 413.
 // done is called after each accepted batch with the number of punches it
-// held.
-func (r *Relay) upload(ctx context.Context, serial string, punches []device.Punch, batch *int, done func(n int) error) error {
-	if *batch <= 0 || *batch > maxBatch {
-		*batch = maxBatch
+// held. A refused batch is split until the punch UPAX refuses is found;
+// done then sets that one punch aside (refused true), so a single bad
+// record can't hold up the ones after it.
+func (r *Relay) upload(ctx context.Context, serial string, punches []device.Punch, st *batching, done func(n int, refused bool) error) error {
+	if st.size <= 0 || st.size > maxBatch {
+		st.size = maxBatch
 	}
+	limit := st.size // smaller while narrowing down a refused punch
 	for len(punches) > 0 {
-		n := min(*batch, len(punches))
+		n := min(limit, len(punches))
 		b := upax.PunchBatch{Serial: serial, Punches: make([]upax.Punch, n)}
 		for i, p := range punches[:n] {
 			wc := p.WorkCode
@@ -541,18 +560,34 @@ func (r *Relay) upload(ctx context.Context, serial string, punches []device.Punc
 			b.Punches[i] = upax.Punch{PIN: p.PIN, Local: p.Time.Format(time.DateTime), State: p.State, Verify: p.Verify, WorkCode: wc}
 		}
 		accepted, err := r.api.Punches(ctx, b)
-		if upax.IsStatus(err, http.StatusRequestEntityTooLarge) && *batch > 1 {
-			*batch = max(1, n/2)
-			r.log.Info("UPAX found the batch too large; halving it", "serial", serial, "batch", *batch)
+		switch {
+		case upax.IsStatus(err, http.StatusRequestEntityTooLarge) && n > 1:
+			st.size = max(1, n/2)
+			limit = st.size
+			r.log.Info("UPAX found the batch too large; halving it", "serial", serial, "batch", st.size)
 			continue
-		}
-		if err != nil {
+		case punchRefused(err) && n > 1:
+			limit = max(1, n/2)
+			continue
+		case punchRefused(err) && st.refused >= maxRefusedInARow:
+			return fmt.Errorf("UPAX refused %d punches in a row; holding the rest: %w", st.refused, err)
+		case punchRefused(err):
+			st.refused++
+			p := punches[0]
+			r.log.Error("UPAX refused a punch; setting it aside", "serial", serial, "user", p.PIN, "time", p.Time.Format(time.DateTime), "state", p.State, "err", err)
+			if err := done(1, true); err != nil {
+				return err
+			}
+			punches, limit = punches[1:], st.size
+			continue
+		case err != nil:
 			return err
 		}
+		st.refused = 0
 		if accepted != n {
 			r.log.Warn("UPAX accepted a different number of punches than sent", "serial", serial, "sent", n, "accepted", accepted)
 		}
-		if err := done(n); err != nil {
+		if err := done(n, false); err != nil {
 			return err
 		}
 		punches = punches[n:]
@@ -596,7 +631,7 @@ func (r *Relay) maintainKey(ctx context.Context) {
 		return
 	}
 	r.log.Info("the relay key is a year old; rotating it")
-	next, err := RotateKey(ctx, r.api, path)
+	next, err := RotateKey(ctx, r.api, path, r.hello())
 	if err != nil {
 		r.log.Warn("key rotation failed; will retry at a later sync", "err", err)
 		return
@@ -607,11 +642,15 @@ func (r *Relay) maintainKey(ctx context.Context) {
 
 // RotateKey replaces the relay key at path: it registers a new key with
 // UPAX (signed with the current one), then swaps the files, keeping the old
-// key as path.prev. The new key is written to path.next first, so a crash
-// between UPAX's answer and the swap is recovered at the next start.
-func RotateKey(ctx context.Context, api *upax.Client, path string) (*identity.Key, error) {
-	cur, err := identity.Load(path)
-	if err != nil {
+// key as path.prev. The new key is written to path.next first, so a
+// rotation whose answer never arrived is settled later: by ResumeRotation
+// at the next start, or here, before another key is made. hello is the
+// sync request used to try a pending key.
+func RotateKey(ctx context.Context, api *upax.Client, path string, hello upax.SyncRequest) (*identity.Key, error) {
+	if next, err := ResumeRotation(ctx, api, path, hello); err != nil || next != nil {
+		return next, err
+	}
+	if _, err := identity.Load(path); err != nil {
 		return nil, err
 	}
 	next, err := identity.Generate()
@@ -622,38 +661,70 @@ func RotateKey(ctx context.Context, api *upax.Client, path string) (*identity.Ke
 		return nil, err
 	}
 	if err := api.RotateKey(ctx, next); err != nil {
-		os.Remove(path + ".next")
+		// Without a clear refusal UPAX may have stored the key: keep it.
+		if refused(err) {
+			os.Remove(path + ".next")
+		}
 		return nil, err
 	}
-	// UPAX has the new key now: install it even if the old one can't be
-	// kept (.prev is only a fallback).
-	_ = cur.Save(path + ".prev")
-	if err := os.Rename(path+".next", path); err != nil {
+	return next, installKey(path)
+}
+
+// ResumeRotation settles a rotation interrupted before the relay knew the
+// outcome (path.next is still there). If UPAX accepts the pending key it
+// becomes the key and is returned; if UPAX doesn't know it, it is
+// discarded. Any other failure keeps it for a later try.
+func ResumeRotation(ctx context.Context, api *upax.Client, path string, hello upax.SyncRequest) (*identity.Key, error) {
+	next, err := identity.Load(path + ".next")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
 		return nil, err
 	}
-	return next, nil
+	probe := &upax.Client{Base: api.Base, RelayID: api.RelayID, Keys: upax.StaticKey{K: next}, HTTP: api.HTTP, UserAgent: api.UserAgent}
+	if _, err := probe.Sync(ctx, hello); err != nil {
+		if e, ok := upax.AsError(err); ok && (e.Status == http.StatusUnauthorized && e.Code != upax.CodeClockSkew || e.Status == http.StatusNotFound) {
+			os.Remove(path + ".next")
+			return nil, nil
+		}
+		return nil, fmt.Errorf("check the pending key with UPAX: %w", err)
+	}
+	return next, installKey(path)
+}
+
+// installKey moves path.next into place, keeping the current key as
+// path.prev. UPAX has the new key by now, so it is installed even if the
+// old one can't be kept (.prev is only a fallback).
+func installKey(path string) error {
+	if cur, err := identity.Load(path); err == nil {
+		_ = cur.Save(path + ".prev")
+	}
+	return os.Rename(path+".next", path)
+}
+
+// refused reports whether err is UPAX's definite refusal of a request, as
+// opposed to a network failure, a timeout or an overloaded server, after
+// which UPAX may or may not have acted on it.
+func refused(err error) bool {
+	e, ok := upax.AsError(err)
+	return ok && e.Status >= 400 && e.Status < 500 &&
+		e.Status != http.StatusRequestTimeout && e.Status != http.StatusTooManyRequests && e.Code != upax.CodeClockSkew
 }
 
 // recoverRotation finishes a rotation interrupted after UPAX answered: if
 // the half-installed new key works, it becomes the key.
 func (r *Relay) recoverRotation(ctx context.Context) {
-	path := r.cfg.KeyPath()
-	next, err := identity.Load(path + ".next")
-	if err != nil {
-		return
-	}
-	probe := &upax.Client{Base: r.api.Base, RelayID: r.api.RelayID, Keys: upax.StaticKey{K: next}, HTTP: r.api.HTTP, UserAgent: r.api.UserAgent}
-	if _, err := probe.Sync(ctx, upax.SyncRequest{Version: r.o.Version, HostName: r.o.HostName}); err != nil {
-		if _, refused := upax.AsError(err); refused {
-			r.log.Info("discarding an unfinished key rotation", "err", err)
-			os.Remove(path + ".next")
-		}
-		return
-	}
-	if cur, err := identity.Load(path); err == nil {
-		_ = cur.Save(path + ".prev")
-	}
-	if err := os.Rename(path+".next", path); err == nil {
+	next, err := ResumeRotation(ctx, r.api, r.cfg.KeyPath(), r.hello())
+	switch {
+	case err != nil:
+		r.log.Warn("could not settle an unfinished key rotation; will retry", "err", err)
+	case next != nil:
 		r.log.Info("finished an interrupted key rotation", "fingerprint", identity.Group(next.Fingerprint()))
 	}
+}
+
+// hello is the smallest sync request: enough to try a key.
+func (r *Relay) hello() upax.SyncRequest {
+	return upax.SyncRequest{Version: r.o.Version, HostName: r.o.HostName}
 }

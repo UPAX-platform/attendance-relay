@@ -107,6 +107,9 @@ func printTerminalHealth(h *relay.TerminalHealth) {
 	if h.Pending > 0 {
 		fmt.Printf("  pending:   %d punches\n", h.Pending)
 	}
+	if h.Refused > 0 {
+		fmt.Printf("  refused:   %d punches UPAX would not take (set aside; see the log)\n", h.Refused)
+	}
 	if h.Spooled > 0 {
 		fmt.Printf("  spooled:   %d punches waiting on this computer\n", h.Spooled)
 	}

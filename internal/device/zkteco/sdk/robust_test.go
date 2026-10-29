@@ -136,3 +136,42 @@ func TestEventFloodEnds(t *testing.T) {
 		t.Fatal("no error")
 	}
 }
+
+// A chunk shorter than asked for would shift every record after it into
+// garbage punches, so it must be an error, not data.
+func TestShortChunkRefused(t *testing.T) {
+	for name, reply := range map[string]func() []byte{
+		"data": func() []byte { return answer(CmdData, make([]byte, 4095)) },
+		"prepared": func() []byte {
+			out := answer(CmdPrepareData, nil)
+			out = append(out, answer(CmdData, make([]byte, 4095))...)
+			return append(out, answer(CmdAckOK, nil)...)
+		},
+	} {
+		c := fakeDevice(t, func(p Packet) []byte {
+			if p.Cmd != CmdReadBuffer {
+				return answer(CmdAckOK, nil)
+			}
+			return reply()
+		})
+		if _, err := c.readChunk(0, 4096); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+}
+
+func TestEmptyChunkFloodEnds(t *testing.T) {
+	c := fakeDevice(t, func(p Packet) []byte {
+		if p.Cmd != CmdReadBuffer {
+			return nil // the client's event acks
+		}
+		out := answer(CmdPrepareData, nil)
+		for range maxEventsSkipped + 1 {
+			out = append(out, answer(CmdData, nil)...)
+		}
+		return out
+	})
+	if _, err := c.readChunk(0, 4096); err == nil {
+		t.Fatal("no error")
+	}
+}

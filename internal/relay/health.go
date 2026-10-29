@@ -59,7 +59,8 @@ type TerminalHealth struct {
 	Uploaded    int64      `json:"uploaded_total"`
 	Pending     int        `json:"pending"`
 	Spooled     int        `json:"spooled,omitempty"`
-	CommKey     string     `json:"comm_key,omitempty"` // "managed" when the relay set it; never the key
+	Refused     int64      `json:"refused_total,omitempty"` // punches UPAX refused, set aside since start
+	CommKey     string     `json:"comm_key,omitempty"`      // "managed" when the relay set it; never the key
 	LastError   string     `json:"last_error,omitempty"`
 	LastErrorAt time.Time  `json:"last_error_at,omitzero"`
 	StartedAt   time.Time  `json:"started_at"`

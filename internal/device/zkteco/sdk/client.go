@@ -283,10 +283,12 @@ func (c *Client) readBuffered(command uint16, fct, ext int32) ([]byte, error) {
 	case !ok(p) || len(p.Data) < 5:
 		return nil, fmt.Errorf("zk: buffered read not supported (response %d)", p.Cmd)
 	}
-	size := int(le.Uint32(p.Data[1:]))
-	if size > maxBufferedSize {
-		return nil, fmt.Errorf("zk: device announced a %d-byte table", size)
+	// Compare before converting: on 32-bit builds a huge size goes negative.
+	announced := le.Uint32(p.Data[1:])
+	if announced > maxBufferedSize {
+		return nil, fmt.Errorf("zk: device announced a %d-byte table", announced)
 	}
+	size := int(announced)
 	out := make([]byte, 0, size)
 	for start := 0; start < size; {
 		n := min(size-start, maxBufferedChunk)
@@ -296,6 +298,9 @@ func (c *Client) readBuffered(command uint16, fct, ext int32) ([]byte, error) {
 		}
 		out = append(out, chunk...)
 		start += n
+	}
+	if len(out) != size {
+		return nil, fmt.Errorf("zk: read %d bytes of a %d-byte table", len(out), size)
 	}
 	if _, err := c.command(CmdFreeData, nil); err != nil {
 		return nil, err
@@ -311,23 +316,37 @@ func (c *Client) readChunk(start, size int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A short or long chunk would shift every record after it, so anything
+	// but exactly the bytes asked for is an error.
 	switch p.Cmd {
 	case CmdData:
+		if len(p.Data) != size {
+			return nil, fmt.Errorf("zk: chunk %d:%d came back with %d bytes", start, size, len(p.Data))
+		}
 		return p.Data, nil
 	case CmdPrepareData:
 		var out []byte
+		idle := 0 // packets that brought no data
 		for {
 			q, err := c.readPacket()
 			if err != nil {
 				return nil, err
 			}
+			if q.Cmd != CmdData || len(q.Data) == 0 {
+				if idle++; idle > maxEventsSkipped {
+					return nil, fmt.Errorf("zk: no data from the device while reading chunk %d:%d", start, size)
+				}
+			}
 			switch q.Cmd {
 			case CmdData:
-				if len(out)+len(q.Data) > size+maxBufferedChunk {
+				if len(out)+len(q.Data) > size {
 					return nil, fmt.Errorf("zk: device sent more than the %d bytes asked for", size)
 				}
 				out = append(out, q.Data...)
 			case CmdAckOK:
+				if len(out) != size {
+					return nil, fmt.Errorf("zk: chunk %d:%d came back with %d bytes", start, size, len(out))
+				}
 				return out, nil
 			case CmdRegEvent:
 				c.ackEvent()

@@ -36,7 +36,7 @@ type pushTerm struct {
 	cmds     []upax.Command
 	maxSeq   int64
 	skew     *int
-	batch    int
+	batch    batching
 	waiting  string
 }
 
@@ -174,13 +174,19 @@ func (r *Relay) Store(serial string, punches []device.Punch, stamp string) error
 	}
 	err := p.saveMeta()
 	p.mu.Unlock()
+	if err != nil {
+		// The punches are safe in the spool, so the terminal still gets OK:
+		// refusing would have it send them again, into the spool again. A
+		// stale stamp only makes it re-send what UPAX dedupes.
+		r.log.Warn("could not save a push terminal's upload stamp", "serial", serial, "err", err)
+	}
 	p.estimateSkew(punches)
 	p.health.update(func(h *TerminalHealth) { h.Spooled = p.spool.Pending() })
 	select {
 	case p.notify <- struct{}{}:
 	default:
 	}
-	return err
+	return nil
 }
 
 func (r *Relay) Stamp(serial string) string {
@@ -357,7 +363,14 @@ func (p *pushTerm) drain(ctx context.Context) (time.Duration, error) {
 		if !ok {
 			return 0, nil
 		}
-		err = p.r.upload(ctx, p.serial, punches, &p.batch, func(n int) error {
+		err = p.r.upload(ctx, p.serial, punches, &p.batch, func(n int, refused bool) error {
+			if refused {
+				if err := p.spool.Reject(name, n); err != nil {
+					return err
+				}
+				p.health.update(func(h *TerminalHealth) { h.Refused += int64(n); h.Spooled = p.spool.Pending() })
+				return nil
+			}
 			if err := p.spool.Done(name, n); err != nil {
 				return err
 			}

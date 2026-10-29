@@ -36,6 +36,9 @@ type Device struct {
 	// BeforeAttLogRead, if set, runs just before the attendance table is
 	// snapshotted for a download, e.g. to land a punch mid-read.
 	BeforeAttLogRead func()
+	// DropRefreshReply applies options on CMD_REFRESHOPTION but drops the
+	// connection instead of answering, as when the link fails mid-command.
+	DropRefreshReply bool
 
 	mu       sync.Mutex
 	options  map[string]string // written with CMD_OPTIONS_WRQ, applied on refresh
@@ -237,7 +240,11 @@ func (d *Device) serve(conn net.Conn) {
 				n, _ := strconv.ParseUint(v, 10, 32)
 				d.Password = uint32(n)
 			}
+			drop := d.DropRefreshReply
 			d.mu.Unlock()
+			if drop {
+				return
+			}
 			err = write(sdk.CmdAckOK, r, nil)
 		case sdk.CmdGetFreeSizes:
 			d.mu.Lock()
@@ -262,7 +269,9 @@ func (d *Device) serve(conn net.Conn) {
 			case sdk.CmdUserTempRRQ:
 				pending = d.userData()
 			default:
-				err = write(sdk.CmdAckError, r, nil)
+				if write(sdk.CmdAckError, r, nil) != nil {
+					return
+				}
 				continue
 			}
 			b := make([]byte, 9)

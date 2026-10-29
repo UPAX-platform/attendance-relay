@@ -120,6 +120,7 @@ func cmdSetup(args []string) error {
 	}
 
 	// 1. UPAX and pairing.
+	pairedWith := cfg.UPAX
 	if *base != "" {
 		cfg.UPAX = strings.TrimRight(strings.TrimSpace(*base), "/")
 	}
@@ -130,10 +131,15 @@ func cmdSetup(args []string) error {
 	if err := upax.ValidateBase(cfg.UPAX); err != nil {
 		return err
 	}
-	if _, err := identity.Load(cfg.KeyPath()); cfg.RelayID != "" && err == nil && !*newKey && *code == "" {
+	moved := cfg.RelayID != "" && cfg.UPAX != pairedWith
+	if _, err := identity.Load(cfg.KeyPath()); cfg.RelayID != "" && err == nil && !*newKey && *code == "" && !moved {
 		k, _ := identity.Load(cfg.KeyPath())
 		fmt.Printf("\nThis relay is already paired (fingerprint %s).\n", identity.Group(k.Fingerprint()))
 	} else {
+		if moved {
+			// The relay id belongs to the old address's UPAX.
+			fmt.Printf("\nThis relay was paired with %s; pair it with %s.\n", pairedWith, cfg.UPAX)
+		}
 		if *code == "" {
 			fmt.Println("\nCreate a pairing code in UPAX: HR › Devices › Relays › Add relay.")
 			*code = prompt("Pairing code", "")
@@ -223,7 +229,10 @@ func cmdSetup(args []string) error {
 	// 5. Service.
 	doInstall := *install == "yes" || (*install == "ask" && isTTY() && yes("Install and start the relay as a background service?", true))
 	if !doInstall {
-		fmt.Printf("\nInstall and start the service later with:  upax-relay install --config %q && upax-relay start\n", cfg.Path())
+		// A running service still has the old config (and pairing) loaded.
+		if !restartIfRunning(cfg.Path()) {
+			fmt.Printf("\nInstall and start the service later with:  upax-relay install --config %q && upax-relay start\n", cfg.Path())
+		}
 		return nil
 	}
 	started := time.Now()

@@ -2,6 +2,9 @@ package upax_test
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,5 +148,24 @@ func TestValidateBase(t *testing.T) {
 		if err := upax.ValidateBase(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+func TestRedirectNotFollowed(t *testing.T) {
+	_, c, _ := paired(t)
+	var hit atomic.Bool
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit.Store(true) }))
+	defer elsewhere.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+	c.Base = redirect.URL
+	_, err := c.Punches(context.Background(), upax.PunchBatch{Serial: "X", Punches: []upax.Punch{{PIN: "1", Local: "2026-10-28 08:00:00"}}})
+	if !upax.IsStatus(err, http.StatusTemporaryRedirect) {
+		t.Fatalf("err = %v, want the 307 itself", err)
+	}
+	if hit.Load() {
+		t.Fatal("the signed request was re-sent to the redirect target")
 	}
 }

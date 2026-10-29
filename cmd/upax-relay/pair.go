@@ -115,17 +115,22 @@ func cmdPair(args []string) error {
 	return nil
 }
 
-// restartIfRunning restarts the service so it picks up a new pairing.
-func restartIfRunning(cfgPath string) {
+// restartIfRunning restarts the service so it picks up a new pairing or
+// config. It reports whether the service was running.
+func restartIfRunning(cfgPath string) bool {
 	s, _, err := newService(cfgPath, "")
 	if err != nil {
-		return
+		return false
 	}
-	if st, err := s.Status(); err == nil && st == service.StatusRunning {
-		if err := s.Restart(); err == nil {
-			fmt.Println("\nRestarted the relay service.")
-		}
+	if st, err := s.Status(); err != nil || st != service.StatusRunning {
+		return false
 	}
+	if err := s.Restart(); err != nil {
+		fmt.Println("\nCould not restart the relay service; restart it to apply the changes:", err)
+	} else {
+		fmt.Println("\nRestarted the relay service.")
+	}
+	return true
 }
 
 func cmdUnpair(args []string) error {
@@ -169,7 +174,7 @@ func cmdRotateKey(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	next, err := relay.RotateKey(ctx, api, cfg.KeyPath())
+	next, err := relay.RotateKey(ctx, api, cfg.KeyPath(), upax.SyncRequest{Version: version, HostName: hostName()})
 	if err != nil {
 		return wrapPerm(fmt.Errorf("could not rotate the key: %w", err))
 	}
